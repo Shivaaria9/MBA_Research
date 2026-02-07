@@ -300,4 +300,179 @@ class AspectAnalyzer:
         total = stats['total_posts']
         print(f"\n{'Metric':<40} {'Count':<10} {'%':<10}")
         print("-"*30)
+        print(f"{'Total posts analyzed':<40} {total:100} {100:.1f}%")
+        print(f"{'Posts mentioning benefits':<40} {stats['posts_with_benefits']:<10}"
+              f"{stats['posts_with_benefits']/total*100:.1f}%")
+        print(f"{'Posts mentioning side effects':<40} {stats['post_with_side_effects']:<10}"
+              f"{stats['post_with_side_effects']/total*100:.1f}%")
+        print(f"{'Posts mentioning BOTH':<40} {stats['posts_with_both']:<10}"
+              f"{stats['posts_with_both']/total*100:.1f}%")
+        print(f"{'Posts mentioning NEITHER':<40} {stats['posts_with_neither']:<10}"
+              f"{stats['posts_with_neither']/total*100:.1f}%")
         
+        #Aspect Frequency Analysis
+        print("\n"+"="*30)
+        print("Benefit Aspects - Frequency Ranking")
+        print("="*30)
+
+        benefit_freq = {}
+        for aspect in self.aspect_dict_benefits.key():
+            count = self.df[f'has_benefit_{aspect}'].sum()
+            benefit_freq[aspect] = count
+        
+        benefit_freq_sorted = sorted(benefit_freq.items(), key=lambda x:x[1],reverse=True)
+        print(f"\n{'Benefit Aspect':<30} {'Count':<10} {'% of Posts':<15}")
+        print("-"*30)
+        for aspect, count in benefit_freq_sorted:
+            print(f"{aspect.replace('_',' ').title():<30} {count:<10}"
+                  f"{count/total*100:.1f}%")
+            
+        print("\n" + "="*30)
+        print("Side Effect Aspects - Frequency Ranking")
+        print("="*30)
+
+        side_effect_freq = {}
+        for aspect in self.aspect_dict.side_effects.keys():
+            count = self.df[f'has_side_effect_{aspect}'].sum()
+            side_effect_freq[aspect] = count
+        
+        side_effect_freq_sorted = sorted(side_effect_freq.items(),key=lambda x: x[1],reverse=True)
+        print(f"\n{'Side Effect Aspect':<30} {'Count':<10} {'% of Posts':<15}")
+        print("-"*30)
+        for aspect, count in side_effect_freq_sorted:
+            print(f"{aspect.replace('_',' ').title():<30} {count:<10}" f"{count/total*100:.1f}%")
+
+        return stats, benefit_freq_sorted,side_effect_freq_sorted
+    
+    def create_visualizations(self, benefit_freq,side_effect_freq_sorted):
+        print("\n"+"="*30)
+        print("Generating Visualization")
+        print("="*30)
+        fig,axes = plt.subplots(2,2,figsize=(16,12))
+
+        #To plot aspect (Benefits vs side effecs)
+        aspect_comparison = pd.DataFrame({
+            'Category':['Benefits','Side Effects'],
+            'Count':[
+                (self.df['benefit_count']>0).sum(),
+                (self.df['side_effect_count']>0).sum()
+            ]
+        })
+
+        sns.barplot(data=aspect_comparison,x='Category',y='Count',palette=['green','red'],ax=axes[0,10])
+        axes[0,0].set_title('Posts Mentioning Benefits vs Side Effects',fontsize=14,fontweight='bold')
+        axes[0,0].set_ylabel('Number of posts')
+
+        #Display of top 5 benefits
+        top_benefits = benefit_freq[:5]
+        benefit_names = [b[0].replace('_',' ').title() for b in top_benefits]
+        benefit_count = [b[1] for b in top_benefits]
+
+        sns.barplot(x=benefit_count, y=benefit_names,palette='Green_r',ax=axes[0,1])
+        axes[0,1].set_title('Top 5 Most Mentioned Benefits',fontsize=14,fontweight='bold')
+        axes[0,1].set_xlabel('Number of Posts')
+
+        #Display of Top 5 Side Effects
+        top_side_effects = side_effect_freq[:5]
+        se_names = [se[0].replace('_', ' ').title() for se in top_side_effects]
+        se_count = [se[1] for se in top_side_effects]
+
+        sns.barplot(x=se_count,y=se_names,palette='Red_r',ax=axes[1,0])
+        axes[1,0].set_title('Top 5 Most Metioned Side Effects',fontsize=14,fontweight='bold')
+        axes[1,0].set_xlabel('Number of Posts')
+
+        #To display the co-occurence of the word(bith vs either)
+        co_occurence = pd.DataFrame({
+            'Type':['Benefits only', 'Side Effects Only', 'Both', 'Neither'],
+            'Count': [
+                ((self.df['benefit_count'] > 0) & (self.df['side_effect_count'] == 0)).sum(),
+                 ((self.df['benefit_count'] == 0) & (self.df['side_effect_count'] > 0)).sum(),
+                  ((self.df['benefit_count'] > 0) & (self.df['side_effect_count'] > 0)).sum(),
+                   ((self.df['benefit_count'] == 0) & (self.df['side_effect_count'] == 0)).sum()
+            ]
+        })
+
+        axes[1,1].pie(co_occurence['Count'], labels=co_occurence['Type'],autopct = '%1.1f%%', startangle=90,
+                      colors=['lightgreeen','lightcoral','gold','lightgray'])
+        axes[1,1].set_title('Aspect co-occurence Patterns',fontsize=14,fontweight='bold')
+
+        plt.tight_layout()
+
+    plt.savefig('Aspect_Extraction_Result.png',dpi=300,bbox_inches='tight')
+    print("\n Visulization is saved")
+
+    def extract_example_posts(self):
+        print("\n"+"="*30)
+        print("Extracting the post info")
+        print("="*30)
+
+        example = []
+
+        benefits_only = self.df[
+            (self.df['benefit_count'] > 0) &
+            (self.df['side_effect_count'] == 0)
+        ].sample(min(5,len(self.df)), random_state=42)
+
+        side_effects_only = self.df[
+            (self.df['benefit_count'] == 0) &
+            (self.df['side_effect_count'] > 0)
+        ].sample(min(5,len(self.df)), random_state=42)
+
+        both = self.df[
+            (self.df['benefit_count'] > 0) &
+            (self.df['side_effect_count'] > 0)
+        ].sample(min(5,len(self.df)), random_state=42)
+
+        example_df = pd.concat([
+            benefits_only[['text','benefits_found','side_effects_found']],
+            side_effects_only[['text','benefits_found','side_Effects_found']],
+            both[['text','benefits_found','side_effects_found']]
+        ])
+
+        example_df.to_csv('analysis1_aspect_posts.csv',index=False)
+
+        print("\n Posts saved to csv file")
+        print(f" -Benefits only : 5 examples")
+        print(f" -Side effects only : 5 examples")
+        print(f" -Both mentioned : 5 examples")
+
+        #Main Execution
+    def main():
+        print("\n"+"="*30)
+        print("Analysis 1: Aspect Extraction")
+        print("Problem Statment 1:Cogonitive Trade-offs Between Benefits and Side Effects")
+        print("="*30)
+
+        #code line to load the data
+        loader = DataLoader(
+            primary_path='ozempic_reddit_primary_data.csv',
+            secondary_path='ozempic_reviews_secondary_data.csv'
+        )
+        df=loader.load_data()
+
+        #code line to execute the extarct aspect method
+        extractor = AspectExtractor()
+        df, dependency_results = extractor.process_dataset(df)
+
+        #code line to analyze the results
+        analyzer = AspectAnalyzer(df,extractor.aspect_dict)
+        stats, benefit_freq, side_effect_freq = analyzer.generate_summary_statistics()
+        analyzer.create_visualizations(benefit_freq,side_effect_freq)
+        analyzer.extract_example_posts()
+
+        #to save the complete results
+        print("\n"+ "="*30)
+        print("Saving the Final results")
+        print("="*30)
+        df.to_csv(aspect_extraction_complete.csv,index=False)
+        print("\n Complete dataset saved as csv file")
+
+        print("\n"+"="*30)
+        print("Analysis 1 - Aspect Extraction Complete")
+        print("="*30)
+        
+        return df,stats
+
+    if __name__ == "main":
+         df_results,statistics = main()
+
