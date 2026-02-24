@@ -55,9 +55,9 @@ class DataLoader:
             )
         
         print(f"✓ Loaded {len(df)} posts with aspect annotations")
-        print(f"  - Posts with benefits: {(df['benefit_count'] > 0).sum()}")
+        print(f"  - Posts with benefits: {(df['benefits_count'] > 0).sum()}")
         print(f"  - Posts with side effects: {(df['side_effect_count'] > 0).sum()}")
-        print(f"  - Posts with both: {((df['benefit_count'] > 0) & (df['side_effect_count'] > 0)).sum()}")
+        print(f"  - Posts with both: {((df['benefits_count'] > 0) & (df['side_effect_count'] > 0)).sum()}")
         
         return df
 
