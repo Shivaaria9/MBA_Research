@@ -271,7 +271,7 @@ class AspectExtractor:
         df['benefits_count'] = df['benefits_found'].apply(len)
         df['side_effect_count'] = df['side_effects_found'].apply(len)
 
-        #Create a binary flags or hard encode for eacdh aspect
+        #Create a binary flags or hard encode for each aspect
         for aspect_name in self.aspect_dict.benefits.keys():
             df[f'has_benefit_{aspect_name}'] = df['benefits_found'].apply(
                 lambda x: aspect_name in x

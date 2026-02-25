@@ -16,6 +16,7 @@ import nltk
 nltk.download('punkt')
 
 # Try to load transformer model (optional)
+TRANSFORMER_AVAILABLE = False  # Initialize first
 try:
     from transformers import pipeline
     TRANSFORMER_AVAILABLE = True
@@ -69,6 +70,8 @@ class SentimentAnalyzers:
     """Multiple sentiment analysis methods for triangulation"""
     
     def __init__(self):
+        global TRANSFORMER_AVAILABLE  # Use global variable
+        
         # VADER - Best for social media
         self.vader = SentimentIntensityAnalyzer()
         
@@ -211,8 +214,11 @@ class AspectSentimentExtractor:
         # Get keywords for this aspect
         keywords = self.aspect_keywords.get(aspect_name, [])
         
-        # Split into sentences
-        sentences = sent_tokenize(text)
+        # Split into sentences - using simple regex to avoid NLTK issues
+        # This splits on . ! ? followed by space or end of string
+        import re
+        sentences = re.split(r'[.!?]+\s*', text)
+        sentences = [s.strip() for s in sentences if s.strip()]
         
         # Find sentences containing aspect keywords
         aspect_sentences = []
@@ -499,6 +505,115 @@ class ABSAStatistics:
             print("\n✗ No asymmetry: Symmetric evaluation")
 
 # ============================================================================
+# STEP 6: EXPLICIT WITHIN-POST TRADE-OFF ANALYSIS
+# ============================================================================
+
+class TradeOffAnalyzer:
+    """
+    Explicit Within-Post Trade-Off Analysis
+    
+    Tests compensatory decision-making by comparing benefit vs side-effect
+    sentiment within the SAME post.
+    """
+
+    def __init__(self, df, aspect_stats):
+        self.df = df
+        self.aspect_stats = aspect_stats
+
+    def run_tradeoff_analysis(self):
+
+        print("\n" + "="*70)
+        print("STEP 5: EXPLICIT WITHIN-POST TRADE-OFF ANALYSIS")
+        print("="*70)
+
+        # Identify benefit and side-effect columns dynamically
+        benefit_cols = [
+            f'sentiment_{a}' for a in self.aspect_stats.keys()
+            if self.aspect_stats[a]['type'] == 'benefit'
+        ]
+
+        side_effect_cols = [
+            f'sentiment_{a}' for a in self.aspect_stats.keys()
+            if self.aspect_stats[a]['type'] == 'side_effect'
+        ]
+
+        # Select posts mentioning BOTH
+        df_trade = self.df[
+            (self.df['benefits_count'] > 0) &
+            (self.df['side_effect_count'] > 0)
+        ].copy()
+
+        print(f"Posts mentioning BOTH benefits and side effects: {len(df_trade)}")
+
+        if len(df_trade) == 0:
+            print("No posts contain both aspects. Trade-off analysis not possible.")
+            return None
+
+        # Compute mean benefit and side-effect sentiment per post
+        df_trade['mean_benefit_sentiment'] = df_trade[benefit_cols].mean(axis=1, skipna=True)
+        df_trade['mean_side_effect_sentiment'] = df_trade[side_effect_cols].mean(axis=1, skipna=True)
+
+        # Trade-off score
+        df_trade['tradeoff_score'] = (
+            df_trade['mean_benefit_sentiment'] -
+            abs(df_trade['mean_side_effect_sentiment'])
+        )
+
+        # Summary statistics
+        mean_benefit = df_trade['mean_benefit_sentiment'].mean()
+        mean_side = df_trade['mean_side_effect_sentiment'].mean()
+        mean_tradeoff = df_trade['tradeoff_score'].mean()
+
+        print("\nWithin-Post Means:")
+        print(f"  Mean Benefit Sentiment:      {mean_benefit:+.3f}")
+        print(f"  Mean Side Effect Sentiment:  {mean_side:+.3f}")
+        print(f"  Mean Trade-Off Score:        {mean_tradeoff:+.3f}")
+
+        # Paired t-test (stronger than independent test here)
+        t_stat, p_value = stats.ttest_rel(
+            df_trade['mean_benefit_sentiment'],
+            df_trade['mean_side_effect_sentiment']
+        )
+
+        print("\nPaired t-test (within-post comparison):")
+        print(f"  t-statistic: {t_stat:.3f}")
+        print(f"  p-value: {p_value:.4f}")
+
+        # Effect size (paired Cohen's d)
+        diff = (
+            df_trade['mean_benefit_sentiment'] -
+            df_trade['mean_side_effect_sentiment']
+        )
+        cohens_d = diff.mean() / diff.std()
+
+        print(f"\nEffect Size (Paired Cohen's d): {cohens_d:.3f}")
+
+        if abs(cohens_d) > 0.8:
+            print("  Interpretation: LARGE effect")
+        elif abs(cohens_d) > 0.5:
+            print("  Interpretation: MEDIUM effect")
+        else:
+            print("  Interpretation: SMALL effect")
+
+        # Dominance rate
+        dominance_rate = (df_trade['tradeoff_score'] > 0).mean()
+
+        print(f"\nBenefit Dominance Rate: {dominance_rate*100:.2f}%")
+
+        if mean_tradeoff > 0:
+            print("\n✓ TRADE-OFF CONFIRMED")
+            print("  Within the same post, benefits outweigh harms.")
+            print("  → Strong evidence of compensatory decision-making.")
+        else:
+            print("\n✗ No systematic trade-off detected.")
+
+        # Save trade-off dataset
+        df_trade.to_csv('analysis2_within_post_tradeoff.csv', index=False)
+        print("\n✓ Trade-off dataset saved as 'analysis2_within_post_tradeoff.csv'")
+
+        return df_trade
+
+# ============================================================================
 # STEP 6: VISUALIZATIONS
 # ============================================================================
 
@@ -513,7 +628,7 @@ class ABSAVisualizer:
         """Generate comprehensive visualization dashboard"""
         
         print("\n" + "="*70)
-        print("STEP 5: Generating Visualizations")
+        print("STEP 6: Generating Visualizations")
         print("="*70)
         
         fig, axes = plt.subplots(2, 2, figsize=(16, 12))
@@ -627,14 +742,18 @@ def main():
     stats_analyzer = ABSAStatistics(df, aspect_stats)
     test_results = stats_analyzer.test_benefit_vs_side_effect()
     stats_analyzer.test_asymmetry_hypothesis()
+
+    # Step 4: Explicit Within-Post Trade-Off Analysis
+    tradeoff_analyzer = TradeOffAnalyzer(df, aspect_stats)
+    df_tradeoff = tradeoff_analyzer.run_tradeoff_analysis()
     
-    # Step 4: Visualizations
+    # Step 5: Visualizations
     visualizer = ABSAVisualizer(df, aspect_stats)
     visualizer.create_dashboard()
     
-    # Step 5: Save results
+    # Step 6: Save results
     print("\n" + "="*70)
-    print("STEP 6: Saving Results")
+    print("STEP 7: Saving Results")
     print("="*70)
     
     df.to_csv('analysis2_absa_complete.csv', index=False)
@@ -671,13 +790,7 @@ def main():
         print("  → Evidence of cognitive reweighting")
         print("  → Supports compensatory decision-making model")
     
-    print("\n" + "="*70)
-    print("NEXT STEPS")
-    print("="*70)
-    print("1. Review aspect sentiments for face validity")
-    print("2. Examine posts with high benefit + high side effect sentiment")
-    print("3. Proceed to Analysis 3: Overall Sentiment Classification")
-    print("4. Then Analysis 4: Linguistic Frame Detection (explains HOW reweighting occurs)")
+    
     
     return df, aspect_stats, test_results
 
