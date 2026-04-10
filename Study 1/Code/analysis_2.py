@@ -11,19 +11,17 @@ from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 from textblob import TextBlob
 
 # NLP
-from nltk.tokenize import sent_tokenize
-import nltk
-nltk.download('punkt')
+import re
 
 # Try to load transformer model (optional)
-TRANSFORMER_AVAILABLE = False  # Initialize first
+TRANSFORMER_AVAILABLE = False
 try:
     from transformers import pipeline
     TRANSFORMER_AVAILABLE = True
     print("✓ Transformer models available")
 except:
     TRANSFORMER_AVAILABLE = False
-    print("⚠ Transformer models not available (using VADER only)")
+    print("⚠ Transformer models not available (using VADER + TextBlob)")
 
 # ============================================================================
 # STEP 1: LOAD YOUR ASPECT-EXTRACTED DATA
@@ -58,7 +56,7 @@ class DataLoader:
         print(f"✓ Loaded {len(df)} posts with aspect annotations")
         print(f"  - Posts with benefits: {(df['benefits_count'] > 0).sum()}")
         print(f"  - Posts with side effects: {(df['side_effect_count'] > 0).sum()}")
-        print(f"  - Posts with both: {((df['benefits_count'] > 0) & (df['side_effect_count'] > 0)).sum()}")
+        print(f"  - Posts with BOTH (trade-off candidates): {((df['benefits_count'] > 0) & (df['side_effect_count'] > 0)).sum()}")
         
         return df
 
@@ -70,13 +68,8 @@ class SentimentAnalyzers:
     """Multiple sentiment analysis methods for triangulation"""
     
     def __init__(self):
-        global TRANSFORMER_AVAILABLE  # Use global variable
-        
         # VADER - Best for social media
         self.vader = SentimentIntensityAnalyzer()
-        
-        # TextBlob - Good for subjectivity
-        # (imported directly)
         
         # Transformer - Most accurate (if available)
         self.transformer = None
@@ -91,51 +84,27 @@ class SentimentAnalyzers:
                 print("✓ Loaded transformer model (RoBERTa)")
             except Exception as e:
                 print(f"⚠ Could not load transformer: {e}")
-                TRANSFORMER_AVAILABLE = False
     
     def analyze_vader(self, text):
-        """
-        VADER Sentiment Analysis
-        
-        Method: Lexicon + rules-based
-        Strengths: Great for social media, handles slang
-        Output: compound score (-1 to +1)
-        """
+        """VADER Sentiment Analysis"""
         if not text or len(text.strip()) == 0:
             return 0.0
-        
         scores = self.vader.polarity_scores(text)
-        return scores['compound']  # -1 (most negative) to +1 (most positive)
+        return scores['compound']
     
     def analyze_textblob(self, text):
-        """
-        TextBlob Sentiment Analysis
-        
-        Method: Pattern-based
-        Strengths: Simplicity, subjectivity detection
-        Output: polarity (-1 to +1)
-        """
+        """TextBlob Sentiment Analysis"""
         if not text or len(text.strip()) == 0:
             return 0.0
-        
         blob = TextBlob(text)
         return blob.sentiment.polarity
     
     def analyze_transformer(self, text):
-        """
-        Transformer-based Sentiment (RoBERTa)
-        
-        Method: Deep learning
-        Strengths: Context understanding, highest accuracy
-        Output: score converted to -1 to +1 scale
-        """
+        """Transformer-based Sentiment (RoBERTa)"""
         if not self.transformer or not text or len(text.strip()) == 0:
             return None
-        
         try:
-            result = self.transformer(text[:512])[0]  # Truncate if too long
-            
-            # Convert to -1 to +1 scale
+            result = self.transformer(text[:512])[0]
             label = result['label'].lower()
             score = result['score']
             
@@ -143,13 +112,13 @@ class SentimentAnalyzers:
                 return score
             elif 'negative' in label:
                 return -score
-            else:  # neutral
+            else:
                 return 0.0
         except:
             return None
     
     def analyze_all(self, text):
-        """Run all available analyzers"""
+        """Run all available analyzers and return ensemble"""
         results = {
             'vader': self.analyze_vader(text),
             'textblob': self.analyze_textblob(text)
@@ -175,8 +144,6 @@ class AspectSentimentExtractor:
     
     def __init__(self):
         self.analyzers = SentimentAnalyzers()
-        
-        # Load aspect keywords from Analysis 1
         self.aspect_keywords = self._load_aspect_keywords()
     
     def _load_aspect_keywords(self):
@@ -202,21 +169,13 @@ class AspectSentimentExtractor:
         }
     
     def extract_aspect_sentences(self, text, aspect_name):
-        """
-        Extract sentences mentioning a specific aspect
-        
-        Method: Sentence-level aspect detection
-        Why: Sentiment is more accurate at sentence level than document level
-        """
+        """Extract sentences mentioning a specific aspect"""
         if not text:
             return []
         
-        # Get keywords for this aspect
         keywords = self.aspect_keywords.get(aspect_name, [])
         
-        # Split into sentences - using simple regex to avoid NLTK issues
-        # This splits on . ! ? followed by space or end of string
-        import re
+        # Split into sentences using simple regex
         sentences = re.split(r'[.!?]+\s*', text)
         sentences = [s.strip() for s in sentences if s.strip()]
         
@@ -230,19 +189,11 @@ class AspectSentimentExtractor:
         return aspect_sentences
     
     def analyze_aspect_sentiment(self, text, aspect_name):
-        """
-        Analyze sentiment toward a specific aspect
-        
-        Process:
-        1. Find sentences mentioning the aspect
-        2. Analyze sentiment of each sentence
-        3. Average sentiments (if multiple mentions)
-        """
-        # Extract sentences about this aspect
+        """Analyze sentiment toward a specific aspect"""
         aspect_sentences = self.extract_aspect_sentences(text, aspect_name)
         
         if not aspect_sentences:
-            return None  # Aspect not mentioned
+            return None
         
         # Analyze sentiment of each sentence
         sentiments = []
@@ -250,7 +201,6 @@ class AspectSentimentExtractor:
             sent_scores = self.analyzers.analyze_all(sent)
             sentiments.append(sent_scores['ensemble'])
         
-        # Return average sentiment (if multiple mentions)
         return {
             'mean_sentiment': np.mean(sentiments),
             'max_sentiment': np.max(sentiments),
@@ -320,8 +270,11 @@ class ABSAProcessor:
         
         return self.df
     
-    def calculate_aspect_aggregates(self):
-        """Calculate average sentiment per aspect across all posts"""
+    def calculate_aggregate_sentiments(self):
+        """
+        Calculate aggregate sentiments per aspect
+        This prepares summary statistics for trade-off analysis
+        """
         
         print("\n" + "="*70)
         print("STEP 3: Calculating Aggregate Aspect Sentiments")
@@ -379,6 +332,63 @@ class ABSAProcessor:
                           f"{values.mean():>+.3f}    {values.std():.3f}    {len(values):<10}")
         
         return aspect_stats
+    
+    def prepare_tradeoff_features(self):
+        """
+        NEW: Calculate trade-off indicators for Analysis 6
+        
+        This creates aggregate features that will be used in trade-off analysis
+        """
+        
+        print("\n" + "="*70)
+        print("STEP 4: Preparing Trade-Off Features (for Analysis 6)")
+        print("="*70)
+        
+        benefit_cols = [col for col in self.df.columns if col.startswith('sentiment_') 
+                       and any(b in col for b in ['weight', 'glucose', 'appetite', 'health', 'confidence'])]
+        
+        side_effect_cols = [col for col in self.df.columns if col.startswith('sentiment_') 
+                           and any(se in col for se in ['nausea', 'vomit', 'diarrhea', 'constipation', 
+                                                         'fatigue', 'headache', 'stomach', 'reflux', 'injection'])]
+        
+        # Calculate mean benefit and side effect sentiment per post
+        self.df['mean_benefit_sentiment'] = self.df[benefit_cols].mean(axis=1, skipna=True)
+        self.df['mean_side_effect_sentiment'] = self.df[side_effect_cols].mean(axis=1, skipna=True)
+        
+        # Calculate sentiment gap (magnitude difference)
+        self.df['sentiment_gap'] = (
+            self.df['mean_benefit_sentiment'] - 
+            abs(self.df['mean_side_effect_sentiment'])
+        )
+        
+        # Flag posts with both aspects (trade-off candidates)
+        self.df['has_both_aspects'] = (
+            (self.df['benefits_count'] > 0) & 
+            (self.df['side_effect_count'] > 0)
+        )
+        
+        # Calculate asymmetry (for each post)
+        self.df['sentiment_asymmetry'] = (
+            abs(self.df['mean_benefit_sentiment']) / 
+            (abs(self.df['mean_side_effect_sentiment']) + 0.01)  # Avoid division by zero
+        )
+        
+        print("\n✓ Trade-off features created:")
+        print(f"  - mean_benefit_sentiment: Average sentiment across all benefits")
+        print(f"  - mean_side_effect_sentiment: Average sentiment across all side effects")
+        print(f"  - sentiment_gap: Benefit sentiment - |Side effect sentiment|")
+        print(f"  - has_both_aspects: Boolean flag for trade-off candidates")
+        print(f"  - sentiment_asymmetry: Ratio of |benefit| / |side effect|")
+        
+        # Summary statistics for trade-off candidates
+        tradeoff_posts = self.df[self.df['has_both_aspects'] == True]
+        
+        if len(tradeoff_posts) > 0:
+            print(f"\n✓ Trade-off candidates: {len(tradeoff_posts)} posts")
+            print(f"  - Mean benefit sentiment: {tradeoff_posts['mean_benefit_sentiment'].mean():+.3f}")
+            print(f"  - Mean side effect sentiment: {tradeoff_posts['mean_side_effect_sentiment'].mean():+.3f}")
+            print(f"  - Mean sentiment gap: {tradeoff_posts['sentiment_gap'].mean():+.3f}")
+            print(f"  - Posts where benefits > side effects: {(tradeoff_posts['sentiment_gap'] > 0).sum()} ({(tradeoff_posts['sentiment_gap'] > 0).mean()*100:.1f}%)")
 
 # ============================================================================
 # STEP 5: STATISTICAL ANALYSIS
@@ -392,16 +402,10 @@ class ABSAStatistics:
         self.aspect_stats = aspect_stats
     
     def test_benefit_vs_side_effect(self):
-        """
-        Test: Are benefits more positive than side effects are negative?
+        """Test: Are benefits more positive than side effects are negative?"""
         
-        H0: mean(benefit_sentiment) = -mean(side_effect_sentiment)
-        H1: mean(benefit_sentiment) > -mean(side_effect_sentiment)
-        
-        This tests cognitive reweighting!
-        """
         print("\n" + "="*70)
-        print("STEP 4: Statistical Hypothesis Testing")
+        print("STEP 5: Statistical Hypothesis Testing")
         print("="*70)
         
         # Get all benefit sentiments
@@ -421,7 +425,7 @@ class ABSAStatistics:
                 side_effect_values.extend(self.df[col].dropna().tolist())
         
         # Statistical test
-        print("\n[TEST 1] Benefits vs. Side Effects")
+        print("\n[TEST 1] Benefits vs. Side Effects (Cross-Corpus)")
         print("-"*70)
         
         mean_benefit = np.mean(benefit_values)
@@ -465,153 +469,69 @@ class ABSAStatistics:
             'cohens_d': cohens_d
         }
     
-    def test_asymmetry_hypothesis(self):
+    def test_within_post_comparison(self):
         """
-        Test: Is |benefit_sentiment| > |side_effect_sentiment|?
+        Test: Within posts mentioning BOTH, do benefits outweigh side effects?
+        This is a PREVIEW of Analysis 6 (full trade-off analysis)
+        """
         
-        This tests if benefits are MORE positive than side effects are negative
-        = Evidence of cognitive minimization of harms
-        """
-        print("\n[TEST 2] Asymmetry Hypothesis (Cognitive Reweighting)")
+        print("\n[TEST 2] Within-Post Comparison (Trade-Off Preview)")
         print("-"*70)
         
-        # Calculate absolute values
-        benefit_cols = [f'sentiment_{a}' for a in self.aspect_stats.keys() 
-                       if self.aspect_stats[a]['type'] == 'benefit']
-        side_effect_cols = [f'sentiment_{a}' for a in self.aspect_stats.keys() 
-                           if self.aspect_stats[a]['type'] == 'side_effect']
+        # Filter to posts with both aspects
+        tradeoff_posts = self.df[self.df['has_both_aspects'] == True].copy()
         
-        abs_benefits = []
-        for col in benefit_cols:
-            if col in self.df.columns:
-                abs_benefits.extend(self.df[col].dropna().abs().tolist())
-        
-        abs_side_effects = []
-        for col in side_effect_cols:
-            if col in self.df.columns:
-                abs_side_effects.extend(self.df[col].dropna().abs().tolist())
-        
-        mean_abs_benefit = np.mean(abs_benefits)
-        mean_abs_side_effect = np.mean(abs_side_effects)
-        
-        print(f"Mean |Benefit Sentiment|:      {mean_abs_benefit:.3f}")
-        print(f"Mean |Side Effect Sentiment|:  {mean_abs_side_effect:.3f}")
-        print(f"Difference:                    {mean_abs_benefit - mean_abs_side_effect:+.3f}")
-        
-        if mean_abs_benefit > mean_abs_side_effect:
-            print("\n✓ ASYMMETRY DETECTED: Benefits are MORE positive than side effects are negative")
-            print("  → Evidence of cognitive reweighting (benefits amplified, harms minimized)")
-        else:
-            print("\n✗ No asymmetry: Symmetric evaluation")
-
-# ============================================================================
-# STEP 6: EXPLICIT WITHIN-POST TRADE-OFF ANALYSIS
-# ============================================================================
-
-class TradeOffAnalyzer:
-    """
-    Explicit Within-Post Trade-Off Analysis
-    
-    Tests compensatory decision-making by comparing benefit vs side-effect
-    sentiment within the SAME post.
-    """
-
-    def __init__(self, df, aspect_stats):
-        self.df = df
-        self.aspect_stats = aspect_stats
-
-    def run_tradeoff_analysis(self):
-
-        print("\n" + "="*70)
-        print("STEP 5: EXPLICIT WITHIN-POST TRADE-OFF ANALYSIS")
-        print("="*70)
-
-        # Identify benefit and side-effect columns dynamically
-        benefit_cols = [
-            f'sentiment_{a}' for a in self.aspect_stats.keys()
-            if self.aspect_stats[a]['type'] == 'benefit'
-        ]
-
-        side_effect_cols = [
-            f'sentiment_{a}' for a in self.aspect_stats.keys()
-            if self.aspect_stats[a]['type'] == 'side_effect'
-        ]
-
-        # Select posts mentioning BOTH
-        df_trade = self.df[
-            (self.df['benefits_count'] > 0) &
-            (self.df['side_effect_count'] > 0)
-        ].copy()
-
-        print(f"Posts mentioning BOTH benefits and side effects: {len(df_trade)}")
-
-        if len(df_trade) == 0:
-            print("No posts contain both aspects. Trade-off analysis not possible.")
+        if len(tradeoff_posts) < 10:
+            print("⚠ Too few trade-off posts for reliable statistics")
             return None
-
-        # Compute mean benefit and side-effect sentiment per post
-        df_trade['mean_benefit_sentiment'] = df_trade[benefit_cols].mean(axis=1, skipna=True)
-        df_trade['mean_side_effect_sentiment'] = df_trade[side_effect_cols].mean(axis=1, skipna=True)
-
-        # Trade-off score
-        df_trade['tradeoff_score'] = (
-            df_trade['mean_benefit_sentiment'] -
-            abs(df_trade['mean_side_effect_sentiment'])
-        )
-
-        # Summary statistics
-        mean_benefit = df_trade['mean_benefit_sentiment'].mean()
-        mean_side = df_trade['mean_side_effect_sentiment'].mean()
-        mean_tradeoff = df_trade['tradeoff_score'].mean()
-
-        print("\nWithin-Post Means:")
-        print(f"  Mean Benefit Sentiment:      {mean_benefit:+.3f}")
-        print(f"  Mean Side Effect Sentiment:  {mean_side:+.3f}")
-        print(f"  Mean Trade-Off Score:        {mean_tradeoff:+.3f}")
-
-        # Paired t-test (stronger than independent test here)
+        
+        print(f"Posts with BOTH aspects: {len(tradeoff_posts)}")
+        
+        # Paired t-test (within-post comparison)
+        valid_posts = tradeoff_posts[
+            tradeoff_posts['mean_benefit_sentiment'].notna() & 
+            tradeoff_posts['mean_side_effect_sentiment'].notna()
+        ]
+        
+        if len(valid_posts) < 10:
+            print("⚠ Too few valid pairs for paired t-test")
+            return None
+        
         t_stat, p_value = stats.ttest_rel(
-            df_trade['mean_benefit_sentiment'],
-            df_trade['mean_side_effect_sentiment']
+            valid_posts['mean_benefit_sentiment'],
+            valid_posts['mean_side_effect_sentiment']
         )
-
-        print("\nPaired t-test (within-post comparison):")
+        
+        print(f"\nWithin-post means:")
+        print(f"  Benefit sentiment:      {valid_posts['mean_benefit_sentiment'].mean():+.3f}")
+        print(f"  Side effect sentiment:  {valid_posts['mean_side_effect_sentiment'].mean():+.3f}")
+        print(f"  Sentiment gap:          {valid_posts['sentiment_gap'].mean():+.3f}")
+        
+        print(f"\nPaired t-test:")
         print(f"  t-statistic: {t_stat:.3f}")
         print(f"  p-value: {p_value:.4f}")
-
-        # Effect size (paired Cohen's d)
-        diff = (
-            df_trade['mean_benefit_sentiment'] -
-            df_trade['mean_side_effect_sentiment']
-        )
-        cohens_d = diff.mean() / diff.std()
-
-        print(f"\nEffect Size (Paired Cohen's d): {cohens_d:.3f}")
-
-        if abs(cohens_d) > 0.8:
-            print("  Interpretation: LARGE effect")
-        elif abs(cohens_d) > 0.5:
-            print("  Interpretation: MEDIUM effect")
+        
+        if p_value < 0.001:
+            print(f"  Result: HIGHLY SIGNIFICANT (p < 0.001)")
+        elif p_value < 0.05:
+            print(f"  Result: SIGNIFICANT (p < 0.05)")
         else:
-            print("  Interpretation: SMALL effect")
-
-        # Dominance rate
-        dominance_rate = (df_trade['tradeoff_score'] > 0).mean()
-
-        print(f"\nBenefit Dominance Rate: {dominance_rate*100:.2f}%")
-
-        if mean_tradeoff > 0:
-            print("\n✓ TRADE-OFF CONFIRMED")
-            print("  Within the same post, benefits outweigh harms.")
-            print("  → Strong evidence of compensatory decision-making.")
-        else:
-            print("\n✗ No systematic trade-off detected.")
-
-        # Save trade-off dataset
-        df_trade.to_csv('analysis2_within_post_tradeoff.csv', index=False)
-        print("\n✓ Trade-off dataset saved as 'analysis2_within_post_tradeoff.csv'")
-
-        return df_trade
+            print(f"  Result: Not significant (p >= 0.05)")
+        
+        # Benefit dominance rate
+        dominance = (valid_posts['sentiment_gap'] > 0).mean()
+        print(f"\nBenefit Dominance Rate: {dominance*100:.1f}%")
+        print(f"  (Percentage of posts where benefits outweigh side effects)")
+        
+        if dominance > 0.6:
+            print("\n✓ Strong evidence of benefit dominance")
+            print("  → Supports compensatory decision-making hypothesis")
+        
+        return {
+            'dominance_rate': dominance,
+            't_statistic': t_stat,
+            'p_value': p_value
+        }
 
 # ============================================================================
 # STEP 6: VISUALIZATIONS
@@ -639,15 +559,16 @@ class ABSAVisualizer:
                        if v['type'] == 'benefit']
         benefit_data.sort(key=lambda x: x[1], reverse=True)
         
-        aspects_b = [x[0] for x in benefit_data]
-        values_b = [x[1] for x in benefit_data]
-        
-        axes[0, 0].barh(aspects_b, values_b, color='green', alpha=0.7)
-        axes[0, 0].axvline(x=0, color='black', linestyle='-', linewidth=0.8)
-        axes[0, 0].set_xlabel('Mean Sentiment Score')
-        axes[0, 0].set_title('Benefit Aspect Sentiments (Expected: Positive)', 
-                            fontweight='bold', fontsize=12)
-        axes[0, 0].set_xlim(-1, 1)
+        if benefit_data:
+            aspects_b = [x[0] for x in benefit_data]
+            values_b = [x[1] for x in benefit_data]
+            
+            axes[0, 0].barh(aspects_b, values_b, color='green', alpha=0.7)
+            axes[0, 0].axvline(x=0, color='black', linestyle='-', linewidth=0.8)
+            axes[0, 0].set_xlabel('Mean Sentiment Score')
+            axes[0, 0].set_title('Benefit Aspect Sentiments', 
+                                fontweight='bold', fontsize=12)
+            axes[0, 0].set_xlim(-1, 1)
         
         # Plot 2: Side Effect Sentiments
         se_data = [(k.replace('_', ' ').title(), v['mean']) 
@@ -655,17 +576,18 @@ class ABSAVisualizer:
                    if v['type'] == 'side_effect']
         se_data.sort(key=lambda x: x[1])
         
-        aspects_se = [x[0] for x in se_data]
-        values_se = [x[1] for x in se_data]
+        if se_data:
+            aspects_se = [x[0] for x in se_data]
+            values_se = [x[1] for x in se_data]
+            
+            axes[0, 1].barh(aspects_se, values_se, color='red', alpha=0.7)
+            axes[0, 1].axvline(x=0, color='black', linestyle='-', linewidth=0.8)
+            axes[0, 1].set_xlabel('Mean Sentiment Score')
+            axes[0, 1].set_title('Side Effect Aspect Sentiments', 
+                                fontweight='bold', fontsize=12)
+            axes[0, 1].set_xlim(-1, 1)
         
-        axes[0, 1].barh(aspects_se, values_se, color='red', alpha=0.7)
-        axes[0, 1].axvline(x=0, color='black', linestyle='-', linewidth=0.8)
-        axes[0, 1].set_xlabel('Mean Sentiment Score')
-        axes[0, 1].set_title('Side Effect Aspect Sentiments (Expected: Negative)', 
-                            fontweight='bold', fontsize=12)
-        axes[0, 1].set_xlim(-1, 1)
-        
-        # Plot 3: Comparison (Benefits vs Side Effects)
+        # Plot 3: Comparison
         comparison_data = pd.DataFrame({
             'Category': ['Benefits', 'Side Effects'],
             'Mean Sentiment': [
@@ -683,39 +605,33 @@ class ABSAVisualizer:
                             fontweight='bold', fontsize=12)
         axes[1, 0].set_ylim(-1, 1)
         
-        # Add value labels on bars
         for bar in bars:
             height = bar.get_height()
             axes[1, 0].text(bar.get_x() + bar.get_width()/2., height,
                            f'{height:.3f}',
                            ha='center', va='bottom' if height > 0 else 'top')
         
-        # Plot 4: Distribution Comparison
-        benefit_cols = [f'sentiment_{a}' for a in self.aspect_stats.keys() 
-                       if self.aspect_stats[a]['type'] == 'benefit']
-        side_effect_cols = [f'sentiment_{a}' for a in self.aspect_stats.keys() 
-                           if self.aspect_stats[a]['type'] == 'side_effect']
+        # Plot 4: Trade-off Distribution
+        tradeoff_posts = self.df[self.df['has_both_aspects'] == True]
         
-        all_benefit_vals = []
-        for col in benefit_cols:
-            if col in self.df.columns:
-                all_benefit_vals.extend(self.df[col].dropna().tolist())
-        
-        all_se_vals = []
-        for col in side_effect_cols:
-            if col in self.df.columns:
-                all_se_vals.extend(self.df[col].dropna().tolist())
-        
-        axes[1, 1].hist(all_benefit_vals, bins=30, alpha=0.6, 
-                       color='green', label='Benefits', density=True)
-        axes[1, 1].hist(all_se_vals, bins=30, alpha=0.6, 
-                       color='red', label='Side Effects', density=True)
-        axes[1, 1].axvline(x=0, color='black', linestyle='--', linewidth=1)
-        axes[1, 1].set_xlabel('Sentiment Score')
-        axes[1, 1].set_ylabel('Density')
-        axes[1, 1].set_title('Sentiment Distribution Comparison', 
-                            fontweight='bold', fontsize=12)
-        axes[1, 1].legend()
+        if len(tradeoff_posts) > 0:
+            axes[1, 1].hist(tradeoff_posts['sentiment_gap'], bins=30, 
+                           color='purple', alpha=0.7, edgecolor='black')
+            axes[1, 1].axvline(x=0, color='red', linestyle='--', linewidth=2, 
+                              label='Neutral (no trade-off)')
+            axes[1, 1].set_xlabel('Sentiment Gap (Benefit - |Side Effect|)')
+            axes[1, 1].set_ylabel('Number of Posts')
+            axes[1, 1].set_title('Trade-Off Distribution (Posts with Both Aspects)', 
+                                fontweight='bold', fontsize=12)
+            axes[1, 1].legend()
+            
+            # Add text showing dominance rate
+            dominance = (tradeoff_posts['sentiment_gap'] > 0).mean()
+            axes[1, 1].text(0.95, 0.95, f'Benefit Dominance:\n{dominance*100:.1f}%',
+                           transform=axes[1, 1].transAxes,
+                           fontsize=11, fontweight='bold',
+                           verticalalignment='top', horizontalalignment='right',
+                           bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
         
         plt.tight_layout()
         plt.savefig('analysis2_absa_results.png', dpi=300, bbox_inches='tight')
@@ -736,33 +652,37 @@ def main():
     # Step 2: Process ABSA
     processor = ABSAProcessor(df)
     df = processor.process_dataset()
-    aspect_stats = processor.calculate_aspect_aggregates()
+    aspect_stats = processor.calculate_aggregate_sentiments()
+    processor.prepare_tradeoff_features()  # NEW: Prepare for Analysis 6
     
     # Step 3: Statistical tests
     stats_analyzer = ABSAStatistics(df, aspect_stats)
     test_results = stats_analyzer.test_benefit_vs_side_effect()
-    stats_analyzer.test_asymmetry_hypothesis()
-
-    # Step 4: Explicit Within-Post Trade-Off Analysis
-    tradeoff_analyzer = TradeOffAnalyzer(df, aspect_stats)
-    df_tradeoff = tradeoff_analyzer.run_tradeoff_analysis()
+    within_post_results = stats_analyzer.test_within_post_comparison()
     
-    # Step 5: Visualizations
+    # Step 4: Visualizations
     visualizer = ABSAVisualizer(df, aspect_stats)
     visualizer.create_dashboard()
     
-    # Step 6: Save results
+    # Step 5: Save results
     print("\n" + "="*70)
     print("STEP 7: Saving Results")
     print("="*70)
     
     df.to_csv('analysis2_absa_complete.csv', index=False)
     print("\n✓ Complete dataset saved to 'analysis2_absa_complete.csv'")
+    print("  Contains: Aspect sentiments + trade-off features for Analysis 6")
     
     # Save aspect statistics
     aspect_stats_df = pd.DataFrame(aspect_stats).T
     aspect_stats_df.to_csv('analysis2_aspect_statistics.csv')
     print("✓ Aspect statistics saved to 'analysis2_aspect_statistics.csv'")
+    
+    # Save trade-off candidates for Analysis 6
+    tradeoff_df = df[df['has_both_aspects'] == True].copy()
+    if len(tradeoff_df) > 0:
+        tradeoff_df.to_csv('analysis2_tradeoff_candidates.csv', index=False)
+        print(f"✓ Trade-off candidates saved to 'analysis2_tradeoff_candidates.csv' ({len(tradeoff_df)} posts)")
     
     # Summary report
     print("\n" + "="*70)
@@ -771,7 +691,8 @@ def main():
     print("\nGenerated files:")
     print("  1. analysis2_absa_complete.csv - Full dataset with aspect sentiments")
     print("  2. analysis2_aspect_statistics.csv - Aggregate sentiment per aspect")
-    print("  3. analysis2_absa_results.png - Visualization dashboard")
+    print("  3. analysis2_tradeoff_candidates.csv - Posts for Analysis 6")
+    print("  4. analysis2_absa_results.png - Visualization dashboard")
     
     print("\n" + "="*70)
     print("KEY FINDINGS SUMMARY")
@@ -781,17 +702,21 @@ def main():
     print(f"Statistical Significance:    p = {test_results['p_value']:.4f}")
     print(f"Effect Size (Cohen's d):     {test_results['cohens_d']:.3f}")
     
+    if within_post_results:
+        print(f"\nWithin-Post Analysis:")
+        print(f"Benefit Dominance Rate:      {within_post_results['dominance_rate']*100:.1f}%")
+    
     print("\n" + "="*70)
-    print("INTERPRETATION")
+    print("INTERPRETATION FOR YOUR RESEARCH")
     print("="*70)
+    
     if test_results['mean_benefit'] > abs(test_results['mean_side_effect']):
         print("✓ ASYMMETRIC EVALUATION CONFIRMED")
         print("  Benefits are MORE positive than side effects are negative")
         print("  → Evidence of cognitive reweighting")
-        print("  → Supports compensatory decision-making model")
+        print("  → Prepares ground for Analysis 6 (Trade-off Language Detection)")
     
-    
-    
+     
     return df, aspect_stats, test_results
 
 if __name__ == "__main__":
