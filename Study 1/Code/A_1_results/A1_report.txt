@@ -1,0 +1,41 @@
+==============================================================
+  ANALYSIS 1: ASPECT EXTRACTION — RESULTS
+  Ozempic Consumer Discourse Study
+==============================================================
+
+  DATASET OVERVIEW
+  Total records analysed : 1500
+  Reddit                      : 750  (50.0%)
+  Review_Platform             : 750  (50.0%)
+
+  COVERAGE
+  Posts with ≥1 benefit      : 1095  (73.0%)
+  Posts with ≥1 side effect  : 730  (48.7%)
+  Posts mentioning BOTH       : 515  (34.3%)
+  → These 515 posts are the core trade-off corpus for Analysis 2
+
+  TOP BENEFITS:
+    weight_loss                  ████████████████████████████████  64.6%  (n=969)
+    glucose_control              ███████████████  31.0%  (n=465)
+    appetite_suppression         ███████████  22.3%  (n=334)
+    cardiovascular               █████  11.2%  (n=168)
+    energy_wellbeing             ████  8.1%  (n=121)
+
+  TOP SIDE EFFECTS:
+    gastrointestinal             █████████████  27.8%  (n=417)
+    nausea_vomiting              ██████████  20.3%  (n=304)
+    fatigue                      ██████  12.1%  (n=182)
+    psychological                ███  7.8%  (n=117)
+    serious_events               █  2.2%  (n=33)
+
+  INTERPRETATION FOR RO1:
+  34.3% of records simultaneously mention benefits
+  and side effects — confirming that dual-evaluation discourse
+  exists and providing the aspect-level labels needed for
+  Analysis 2 (ABSA) and Analysis 6 (trade-off detection).
+
+  OUTPUT FILES:
+  results/A1_aspect_results.csv   ← full dataset with flags
+  results/A1_frequency_table.csv  ← aspect frequency counts
+  results/A1_report.txt           ← this report
+==============================================================

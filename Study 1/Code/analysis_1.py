@@ -1,964 +1,641 @@
+'''this code is for both big and small file '''
+import os, re, json, warnings
 import pandas as pd
 import numpy as np
-import re, os, json
-from collections import defaultdict, Counter
-from tqdm import tqdm
-import matplotlib.pyplot as plt
-import matplotlib.gridspec as gridspec
-import seaborn as sns
-import warnings
 warnings.filterwarnings("ignore")
 
-# ── Optional imports (graceful fallback if not installed) ─────
-try:
-    import spacy
-    nlp = spacy.load("en_core_web_sm", disable=["parser", "ner"])
-    USE_SPACY = True
-except Exception:
-    USE_SPACY = False
-    print("⚠ spaCy not found — install: pip install spacy && python -m spacy download en_core_web_sm")
+PRIMARY_FILE   = "original Data prelims/primary.csv"      # ← full scale
+SECONDARY_FILE = "original Data prelims/secondary.csv"  # ← full scale
+OUTPUT_DIR     = "A_1_results"
 
-try:
-    from spellchecker import SpellChecker
-    spell = SpellChecker()
-    USE_SPELLCHECK = True
-except Exception:
-    USE_SPELLCHECK = False
-    print("⚠ pyspellchecker not found — install: pip install pyspellchecker")
+# ── FastText settings ─────────────────────────────────────
+# These are tuned differently for pilot vs full scale.
+# Larger corpus → lower similarity threshold (catches more synonyms)
+#               → higher top_n (checks more neighbours per seed word)
+#               → lower min_count (rarer slang words still get vectors)
+#
+#   PILOT  (1,000–2,000 rows):
+#     FASTTEXT_MIN_CORPUS = 500   FASTTEXT_SIMILARITY = 0.65
+#     FASTTEXT_TOP_N = 20         FASTTEXT_MIN_COUNT  = 3
+#
+#   FULL SCALE  (20,000+ rows):  ← current values below
+#     FASTTEXT_MIN_CORPUS = 5000  FASTTEXT_SIMILARITY = 0.60
+#     FASTTEXT_TOP_N = 30         FASTTEXT_MIN_COUNT  = 2
 
-try:
-    from gensim.models import FastText
-    USE_FASTTEXT = True
-except Exception:
-    USE_FASTTEXT = False
-    print("⚠ gensim not found — install: pip install gensim")
+FASTTEXT_MIN_CORPUS   = 5000   # activate FastText only if corpus ≥ this
+FASTTEXT_SIMILARITY   = 0.60   # lower than pilot → discovers more synonyms
+                                # safe at full scale because embeddings are richer
+FASTTEXT_TOP_N        = 30     # check more neighbours → catches more Reddit slang
+FASTTEXT_MIN_COUNT    = 2      # rare slang (ozempic face, food noise) still vectorised
 
-import nltk
-for r in ["punkt", "stopwords", "wordnet"]:
-    try: nltk.data.find(f"tokenizers/{r}")
-    except: nltk.download(r, quiet=True)
-from nltk.stem import WordNetLemmatizer
-lemmatizer = WordNetLemmatizer()
+# Fuzzy matching threshold — same for both scales
+FUZZY_THRESHOLD       = 85
+
+TEXT_COLUMN    = "combined_text"   # column containing the text to analyse
+# ─────────────────────────────────────────────────────────────
 
 
-# ═══════════════════════════════════════════════════════════════
-# LAYER 1: TEXT NORMALIZATION
-# Handles abbreviations, slang, formatting issues in Reddit text
-# ═══════════════════════════════════════════════════════════════
+# ╔══════════════════════════════════════════════════════════════╗
+# ║   ASPECT DICTIONARY — SEED TERMS                            ║
+# ║                                                              ║
+# ║   Each key  = one aspect category                           ║
+# ║   Each list = seed words (clinical + informal + slang)      ║
+# ║   FastText will EXPAND these from your actual corpus.       ║
+# ╚══════════════════════════════════════════════════════════════╝
 
-# Medical / Ozempic abbreviations — PRESERVE these
-MEDICAL_KEEP = {
-    "a1c", "hba1c", "t2d", "gi", "bp", "bmi",
-    "ozempic", "semaglutide", "tirzepatide", "mounjaro",
-    "glp1", "glp-1", "t2", "lbs", "kg",
+BENEFITS = {
+
+    "weight_loss": [
+        # Clinical / formal
+        "weight loss", "weight reduction", "weight management", "bmi",
+        "obesity", "overweight", "body weight", "body mass",
+        # Measurements
+        "pounds", "lbs", "kilos", "kg", "stone",
+        # Verbs / informal
+        "lost weight", "lose weight", "losing weight",
+        "dropped", "shed", "slim", "slimmer", "lighter",
+        "down lbs", "down pounds", "down kg",
+        # Reddit slang
+        "skinny", "thin", "smaller", "fit into", "clothes fit",
+        "inches off", "waist smaller", "size down",
+    ],
+
+    "appetite_suppression": [
+        # Clinical
+        "appetite", "satiety", "satiation", "anorexigenic",
+        # Common
+        "hunger", "cravings", "craving", "snacking", "overeating",
+        "portion", "full", "fullness", "eat less", "eating less",
+        # Reddit community terms
+        "food noise",          # ← very common on r/Ozempic — dictionary only would miss this
+        "food cravings gone",
+        "not hungry",
+        "forgot to eat",
+        "no appetite",
+        "stopped wanting food",
+        "quiet the hunger",
+        "food thoughts",
+    ],
+
+    "glucose_control": [
+        # Clinical
+        "glucose", "blood glucose", "blood sugar", "glycemic",
+        "a1c", "hba1c", "hemoglobin a1c", "fasting glucose",
+        "insulin", "insulin resistance", "hyperglycemia",
+        "glycemic control", "type 2", "type2", "t2d", "t2dm",
+        # Common
+        "diabetes", "diabetic", "sugar levels", "sugar control",
+        "sugar reading", "sugar spike",
+        # Devices
+        "cgm", "glucometer", "continuous glucose", "glucose monitor",
+    ],
+
+    "energy_wellbeing": [
+        # Energy
+        "energy", "energetic", "vitality", "active", "moving more",
+        "exercise more", "working out more",
+        # Mental / emotional
+        "feel better", "feeling better", "mood", "mental clarity",
+        "brain fog lifted", "clearer head",
+        # Identity
+        "confidence", "confident", "self-esteem", "self-worth",
+        "quality of life", "better life", "life changed",
+        # Physical
+        "inflammation", "joint pain reduced", "mobility", "move easier",
+    ],
+
+    "cardiovascular": [
+        "heart", "cardiovascular", "cardiac",
+        "blood pressure", "hypertension", "bp lowered",
+        "cholesterol", "ldl", "hdl", "triglycerides",
+        "heart health", "heart disease", "heart risk",
+        "stroke risk", "heart attack risk",
+        "reduced cardiovascular", "cardioprotective",
+    ],
 }
 
-# Reddit abbreviations → expand
-ABBREVIATION_MAP = {
-    # Weight / measurement
-    r'\b(\d+)lbs\b':      r'\1 lbs',
-    r'\b(\d+)lb\b':       r'\1 lb',
-    r'\b(\d+)kgs?\b':     r'\1 kg',
-    r'\b(\d+)wks?\b':     r'\1 weeks',
-    r'\b(\d+)mos?\b':     r'\1 months',
-    # Common Reddit shorthand
-    r'\bbc\b':            'because',
-    r'\btbh\b':           '',
-    r'\blol\b':           '',
-    r'\blmao\b':          '',
-    r'\bfr\b':            '',
-    r'\brn\b':            '',
-    r'\bomg\b':           '',
-    r'\bngl\b':           '',
-    r'\bimo\b':           '',
-    r'\bbtw\b':           'by the way',
-    r'\bidk\b':           'i do not know',
-    r'\bngl\b':           '',
-    r'\bwut\b':           'what',
-    r'\by\'all\b':        'everyone',
-    r'\bgonna\b':         'going to',
-    r'\bwanna\b':         'want to',
-    r'\bgotta\b':         'got to',
-    r'\bkinda\b':         'kind of',
-    r'\bsorta\b':         'sort of',
-    r'\bpretty much\b':   'mostly',
-    # Number + unit patterns
-    r'\b(\d+)\s*(?:pound|lb)s?\b': r'\1 lbs',
-    r'\bdown\s+(\d+)\b':           r'lost \1',
-    r'-(\d+)\s*lbs?\b':            r'lost \1 lbs',
+
+SIDE_EFFECTS = {
+
+    "nausea_vomiting": [
+        # Clinical
+        "nausea", "vomiting", "emesis", "antiemetic",
+        # Common
+        "nauseous", "nauseated", "sick to my stomach", "stomach sick",
+        "vomit", "threw up", "throw up", "thrown up",
+        # Reddit slang
+        "queasy", "barf", "barfing", "barfed",    # ← missed by clinical dictionary
+        "puking", "puke", "puked",
+        "retching", "heaving", "dry heaving",
+        "sick feeling", "feel sick", "feeling sick",
+        "can't keep food down", "nothing stays down",
+        "morning sickness",
+    ],
+
+    "gastrointestinal": [
+        # Clinical
+        "diarrhea", "diarrhoea", "constipation", "gastroparesis",
+        "flatulence", "abdominal pain", "gastric",
+        # Common
+        "constipated", "loose stool", "watery stool", "runny stool",
+        "bloating", "bloated", "gas", "gassy",
+        "stomach pain", "stomach cramps", "stomach ache", "stomach issues",
+        "bowel", "bowel issues", "gi issues", "digestive issues",
+        "heartburn", "acid reflux", "indigestion", "reflux",
+        # Reddit community terms
+        "sulfur burps",        # ← extremely common on Reddit — clinical dict misses this
+        "egg burps",
+        "burping", "belching",
+        "gut issues", "gut problems",
+    ],
+
+    "fatigue": [
+        # Clinical
+        "fatigue", "lethargy", "asthenia", "malaise",
+        # Common
+        "tired", "tiredness", "exhausted", "exhaustion",
+        "weak", "weakness", "sluggish", "drained",
+        "no energy", "low energy", "wiped out",
+        # Reddit informal
+        "tired all the time",
+        "can't function",
+        "feel like a zombie",  # ← vivid Reddit expression
+        "dead tired",
+        "bed ridden", "bed rest",
+    ],
+
+    "injection_site": [
+        # Clinical
+        "injection site", "subcutaneous reaction", "lipodystrophy",
+        # Common
+        "injection pain", "needle pain", "bruising", "bruise",
+        "redness", "swelling", "lump", "bump", "knot",
+        "site reaction", "site pain", "painful injection",
+        "hurts to inject", "injection hurts",
+        "auto-injector", "injector pen", "pen hurts",
+    ],
+
+    "hair_muscle_face": [
+        # Clinical
+        "alopecia", "sarcopenia", "muscle wasting", "muscle atrophy",
+        "lean mass loss",
+        # Common
+        "hair loss", "hair thinning", "losing hair", "hair falling out",
+        "muscle loss", "losing muscle",
+        # Reddit community terms
+        "ozempic face",        # ← coined by Reddit community
+        "ozempic butt",
+        "face sagging", "face sunken", "gaunt face",
+        "hollow cheeks", "facial fat loss",
+        "face aging", "looking older",
+        "skin sagging", "loose skin",
+    ],
+
+    "psychological": [
+        # Clinical
+        "anxiety disorder", "depression", "mood disorder",
+        "suicidal ideation", "mental health",
+        # Common
+        "anxiety", "anxious", "depressed", "depression",
+        "mood swings", "irritable", "irritability",
+        "emotional", "crying", "cry a lot",
+        # Cognitive
+        "brain fog",           # ← informal but very common
+        "memory issues", "forgetful", "foggy thinking",
+        "can't concentrate", "concentration issues",
+        # Food relationship
+        "disordered eating", "food relationship", "obsessed with food",
+    ],
+
+    "serious_events": [
+        # Pancreatitis
+        "pancreatitis", "inflamed pancreas", "pancreas pain",
+        "severe stomach pain", "severe back pain",
+        # Thyroid
+        "thyroid cancer", "thyroid tumour", "medullary thyroid",
+        "thyroid warning",
+        # Other serious
+        "kidney failure", "kidney disease", "gallbladder",
+        "gallstones", "hospitalised", "hospitalized", "er visit",
+        "emergency room", "serious side effect",
+    ],
 }
 
-# Reddit slang → standard terms (for matching purposes only, not for display)
-SLANG_NORMALIZATION = {
-    # Nausea synonyms
-    "hurling":        "vomiting",
-    "hurled":         "vomiting",
-    "hurl":           "vomiting",
-    "barfed":         "vomited",
-    "barfing":        "vomiting",
-    "barf":           "vomit",
-    "puking":         "vomiting",
-    "puked":          "vomited",
-    "puke":           "vomit",
-    "threw up":       "vomited",
-    "throw up":       "vomit",
-    "heaving":        "vomiting",
-    "feeling sick":   "nausea",
-    "feel sick":      "nausea",
-    "queasy":         "nausea",
-    "nausious":       "nauseous",
-    # GI synonyms
-    "the runs":       "diarrhea",
-    "loose stool":    "diarrhea",
-    "stomach crzy":   "stomach issues",
-    "bathroom trips": "diarrhea",
-    "toilet trips":   "diarrhea",
-    "gi stuff":       "gastrointestinal issues",
-    "tummy":          "stomach",
-    "guts":           "stomach",
-    # Fatigue
-    "zombie":         "exhausted",
-    "wiped out":      "exhausted",
-    "burnt out":      "fatigued",
-    "drained":        "fatigue",
-    # Ozempic community terms (do NOT normalize — add to dictionary instead)
-    # "ozempic face" — keep as-is, added to dictionary
-    # "food noise"   — keep as-is, added to dictionary
-    # "sulfur burps" — keep as-is, added to dictionary
-    # "brain fog"    — keep as-is, added to dictionary
-}
+# All aspects combined — used in matching loop
+ALL_ASPECTS = {**BENEFITS, **SIDE_EFFECTS}
 
-def normalize_text(text):
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║   LAYER 2 — FASTTEXT SEMANTIC EXPANSION                     ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+def train_fasttext(texts):
     """
-    Layer 1: Normalize Reddit-specific abbreviations and formatting.
-
-    What this handles:
-      - URLs, subreddit/user mentions
-      - Weight formats: "22lbs" → "22 lbs", "-3lbs" → "lost 3 lbs"
-      - Reddit abbrevs: "tbh", "lol", "bc", "fr" etc.
-      - Slang → standard equivalents (barfing → vomiting)
-
-    What this does NOT change:
-      - Medical abbreviations: a1c, hba1c, gi, t2d
-      - Drug names: ozempic, semaglutide
-      - Community terms: food noise, sulfur burps, ozempic face
-        (these are added directly to dictionary)
+    Train FastText on YOUR corpus.
+    Why train on your data instead of using a pre-trained model?
+    → Pre-trained models (Google News) don't know "food noise",
+      "ozempic face", "sulfur burps". Your corpus does.
+    Returns model or None if gensim not available.
     """
-    if not isinstance(text, str):
-        return ""
+    try:
+        from gensim.models import FastText
+        print("  [Layer 2] Training FastText on corpus...")
 
-    text = text.lower()
+        sentences = []
+        for text in texts:
+            if isinstance(text, str):
+                tokens = re.findall(r"[a-z]{2,}", text.lower())
+                if tokens:
+                    sentences.append(tokens)
 
-    # Remove noise
-    text = re.sub(r'http\S+|www\S+', '', text)
-    text = re.sub(r'/r/\w+|/u/\w+', '', text)
-    text = re.sub(r'&amp;|&lt;|&gt;|&quot;|&#\d+;', ' ', text)
-    text = re.sub(r'[^\w\s\.\!\?,\'\-\%]', ' ', text)
+        if len(sentences) < 200:
+            print(f"  [Layer 2] Too few sentences ({len(sentences)}) — skipping FastText")
+            return None
 
-    # Apply abbreviation expansions
-    for pattern, replacement in ABBREVIATION_MAP.items():
-        text = re.sub(pattern, replacement, text, flags=re.IGNORECASE)
+        model = FastText(
+            sentences   = sentences,
+            vector_size = 150,    # larger at full scale → richer vectors
+            window      = 6,      # wider context window → better Reddit slang capture
+            min_count   = FASTTEXT_MIN_COUNT,
+            workers     = 4,
+            epochs      = 15,     # more epochs at full scale → better embeddings
+            sg          = 1,      # skip-gram: better for rare/informal words
+            min_n       = 3,      # character n-gram min size
+            max_n       = 6,      # character n-gram max size → handles misspellings
+        )
+        print(f"  [Layer 2] ✅ FastText trained — vocabulary: {len(model.wv):,} words")
+        return model
 
-    # Apply slang normalization
-    for slang, standard in SLANG_NORMALIZATION.items():
-        text = re.sub(r'\b' + re.escape(slang) + r'\b', standard, text, flags=re.IGNORECASE)
+    except ImportError:
+        print("  [Layer 2] gensim not installed — skipping FastText expansion")
+        print("            Install: pip install gensim")
+        return None
+    except Exception as e:
+        print(f"  [Layer 2] FastText failed: {e} — using seed dictionary only")
+        return None
 
-    # Clean whitespace
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
 
-
-# ═══════════════════════════════════════════════════════════════
-# LAYER 2: SPELL CORRECTION
-# Handles misspellings common in Reddit posts
-# ═══════════════════════════════════════════════════════════════
-
-# Medical terms to PROTECT from spell correction
-# (spell checkers would incorrectly "fix" these)
-PROTECTED_MEDICAL_TERMS = {
-    "ozempic", "semaglutide", "tirzepatide", "mounjaro", "wegovy",
-    "metformin", "insulin", "a1c", "hba1c", "glp1", "t2d",
-    "endocrinologist", "prediabetes", "glycemic", "bariatric",
-    # Community terms — do not correct
-    "ozempic", "food noise", "sulfur burps", "ozempic face", "brain fog",
-}
-
-# Manual override corrections for health/Reddit context
-MANUAL_CORRECTIONS = {
-    # Nausea misspellings
-    "nausia":        "nausea",
-    "nausious":      "nauseous",
-    "nausited":      "nauseated",
-    "nasea":         "nausea",
-    "naseua":        "nausea",
-    # GI misspellings
-    "constipashun":  "constipation",
-    "constipatd":    "constipated",
-    "diarreah":      "diarrhea",
-    "diareah":       "diarrhea",
-    "diarrhoea":     "diarrhea",
-    "diarreha":      "diarrhea",
-    "diahrea":       "diarrhea",
-    # Fatigue misspellings
-    "tierd":         "tired",
-    "exausted":      "exhausted",
-    "fatiuge":       "fatigue",
-    "lethargic":     "lethargic",
-    # Hair misspellings
-    "thinning":      "thinning",
-    "shedding":      "shedding",
-    # General Reddit misspellings
-    "loosing":       "losing",
-    "loosing weight":"losing weight",
-    "crzy":          "crazy",
-    "wrk":           "work",
-}
-
-def correct_spelling(text):
+def expand_with_fasttext(model, seed_dict, threshold, top_n):
     """
-    Layer 2: Correct misspellings using manual corrections + pyspellchecker.
-
-    Strategy:
-    1. Apply manual corrections first (highest precision for health terms)
-    2. Use pyspellchecker for remaining unknown words
-    3. ALWAYS protect medical/drug terms from correction
-
-    Note: Spell correction is applied WORD by WORD — short words (≤3 chars)
-    are skipped to avoid over-correction.
+    For each seed word, find semantically similar words in the corpus.
+    Add them to the keyword list if cosine similarity ≥ threshold.
+    Returns expanded dictionary.
     """
-    if not text:
-        return text
+    expanded = {}
 
-    # Step 1: Apply manual corrections (highest priority)
-    for wrong, right in MANUAL_CORRECTIONS.items():
-        text = re.sub(r'\b' + re.escape(wrong) + r'\b', right, text, flags=re.IGNORECASE)
+    for aspect, seeds in seed_dict.items():
+        new_terms = set()
 
-    # Step 2: pyspellchecker (if available)
-    if USE_SPELLCHECK:
-        words = text.split()
-        corrected = []
-        for word in words:
-            clean_word = re.sub(r'[^\w]', '', word).lower()
-            # Skip: protected terms, short words, numbers, already-clean
-            if (clean_word in PROTECTED_MEDICAL_TERMS
-                    or len(clean_word) <= 3
-                    or clean_word.isdigit()):
-                corrected.append(word)
+        for seed in seeds:
+            # For multi-word seeds, use the last meaningful word as query
+            words = re.findall(r"[a-z]{3,}", seed.lower())
+            if not words:
                 continue
-            # Get suggestion
-            correction = spell.correction(clean_word)
-            if correction and correction != clean_word:
-                corrected.append(word.replace(clean_word, correction))
-            else:
-                corrected.append(word)
-        text = " ".join(corrected)
+            query = words[-1]
 
-    return text
-
-
-# ═══════════════════════════════════════════════════════════════
-# LAYER 3: LEMMATIZATION
-# ═══════════════════════════════════════════════════════════════
-
-def lemmatize_text(text):
-    """
-    Layer 3: Lemmatize using spaCy (preferred) or NLTK fallback.
-    Handles: losing→lose, dropped→drop, pounds→pound, nauseous→nauseou (spaCy)
-    """
-    if not text:
-        return ""
-    if USE_SPACY:
-        doc = nlp(text.lower())
-        return " ".join([token.lemma_ for token in doc if not token.is_space])
-    else:
-        words = text.lower().split()
-        return " ".join([lemmatizer.lemmatize(w, pos='v') for w in words])
-
-
-# ═══════════════════════════════════════════════════════════════
-# LAYER 4A: EXPANDED DICTIONARY
-# Includes slang, community terms, abbreviations — all verified
-# ═══════════════════════════════════════════════════════════════
-
-ASPECTS = {
-
-    # ══ BENEFITS ══════════════════════════════════════════════
-
-    "weight_loss": {
-        "category": "benefit",
-        "description": "Weight reduction",
-        "keywords": [
-            # Standard terms
-            "weight loss", "weight", "pounds", "lbs", "lost", "loss",
-            "drop", "dropped", "shed", "slim", "lighter", "scale",
-            "kilos", "kg",
-            # Reddit formats (after normalization: "22lbs" → "22 lbs")
-            "lbs down", "pounds down", "pounds gone", "lbs gone",
-            "losing weight", "lost weight", "losing lbs",
-            # Informal expressions found on real Reddit
-            "melting off", "weight melting", "the weight is coming off",
-            "dress sizes", "clothes fitting", "fitting into",
-            "scale going down", "scale dropping", "scale shows",
-            "shed the weight", "shed pounds", "dropping pounds",
-            "pounds lighter", "lighter on the scale",
-        ]
-    },
-
-    "appetite_suppression": {
-        "category": "benefit",
-        "description": "Reduced hunger and food cravings",
-        "keywords": [
-            "appetite", "hunger", "hungry", "craving", "cravings",
-            "eating less", "not hungry", "full", "satiety", "satisfied",
-            # Reddit community-coined terms (high frequency in real data)
-            "food noise",        # 120 occ in GenAI; higher in real data
-            "thinking about food", "food 24/7", "not thinking about food",
-            "forget to eat", "forgot to eat", "no interest in food",
-            "food cravings gone", "no cravings",
-            "snacking", "binge", "portion", "portions",
-            "reduced appetite", "appetite gone", "appetite suppressed",
-            # Informal Reddit phrases
-            "could eat forever", "always thinking about food",
-            "food thoughts", "obsessed with food",
-        ]
-    },
-
-    "glucose_control": {
-        "category": "benefit",
-        "description": "Blood glucose and diabetes management",
-        "keywords": [
-            "glucose", "blood sugar", "a1c", "hba1c", "insulin",
-            "diabetes", "diabetic", "sugar levels", "glycemic",
-            "endocrinologist", "readings", "normal range",
-            "blood glucose", "prediabetes", "type 2", "t2d",
-            "sugar control", "sugar stable", "glucose readings",
-            # Reddit formats
-            "a1c dropped", "a1c went from", "a1c went down",
-            "blood sugar down", "sugar down", "numbers down",
-            "no more spikes", "sugar spikes gone",
-        ]
-    },
-
-    "energy_improvement": {
-        "category": "benefit",
-        "description": "Improved energy and vitality",
-        "keywords": [
-            "energy", "energetic", "active", "stamina",
-            "less tired", "more energy", "exhaustion gone",
-            "energy levels", "through the roof",
-            # Reddit informal
-            "so much energy", "tons of energy", "energy back",
-            "not dragging", "not exhausted anymore",
-        ]
-    },
-
-    "confidence_wellbeing": {
-        "category": "benefit",
-        "description": "Psychological wellbeing and confidence",
-        "keywords": [
-            "confidence", "self-esteem", "body image", "proud",
-            "transformation", "new me", "feel better", "motivated",
-            "positive", "healthier", "different person", "surreal",
-            "life-changing", "life changing", "game changer",
-            # Real Reddit expressions
-            "people are noticing", "people are starting to notice",
-            "compliments", "feel amazing", "feel incredible",
-            "never felt better", "best i have ever felt",
-            "look in the mirror", "love my body",
-            "clothes fit", "fitting clothes",
-        ]
-    },
-
-    "cardiovascular_health": {
-        "category": "benefit",
-        "description": "Heart and cardiovascular improvements",
-        "keywords": [
-            "blood pressure", "cholesterol", "triglycerides",
-            "bp", "hypertension", "lipids", "heart health",
-            "cardiovascular", "health markers", "labs improved",
-            "numbers improved", "bloodwork", "blood work",
-        ]
-    },
-
-    # ══ SIDE EFFECTS ══════════════════════════════════════════
-
-    "nausea": {
-        "category": "side_effect",
-        "description": "Nausea and vomiting",
-        "keywords": [
-            # Standard terms
-            "nausea", "nauseous", "vomiting", "vomit",
-            "throwing up", "thrown up", "sick",
-            # Real Reddit slang (after SLANG_NORMALIZATION these become standard)
-            # but also keep originals in case normalization misses any
-            "barfing", "barf", "barfed",
-            "puking", "puke", "puked",
-            "throwing up", "threw up",
-            "hurling", "hurl", "hurled",
-            "queasy",                       # correctly spelled informal term
-            # Community expressions
-            "stomach sick", "sick to stomach", "feel like vomiting",
-            "waves of nausea", "nauseated", "debilitating nausea",
-            "morning sickness", "nausea waves",
-            # Reddit descriptions
-            "stomach doing flips", "stomach churning",
-            "want to puke", "about to puke",
-        ]
-    },
-
-    "gastrointestinal": {
-        "category": "side_effect",
-        "description": "Digestive and GI issues",
-        "keywords": [
-            "diarrhea", "constipation", "stomach", "digestive",
-            "bloating", "bloated", "gas", "cramps", "bowel",
-            "heartburn", "acid reflux", "acidic",
-            "digestive slowdown", "gi issues", "gi stuff",
-            # Reddit community-coined term (very common in real data)
-            "sulfur burps",          # Reddit-specific Ozempic term
-            "sulfur burp",
-            "sulfur belching",
-            "egg burps",             # alternative name used on Reddit
-            # Informal expressions
-            "bathroom trips", "bathroom issues", "running to bathroom",
-            "bathroom every hour", "toilet issues",
-            "stomach issues", "tummy issues",
-            "stomach going crazy", "stomach cramps",
-            "loose stool", "loose stools", "the runs",
-            "bowel issues", "gut issues", "gut problems",
-            "indigestion", "upset stomach",
-        ]
-    },
-
-    "fatigue": {
-        "category": "side_effect",
-        "description": "Fatigue and tiredness",
-        "keywords": [
-            "fatigue", "tired", "exhausted", "tiredness",
-            "lethargy", "drained", "no energy", "sluggish",
-            "exhaustion", "lethargic",
-            # Reddit informal
-            "wiped out", "burnt out", "feel like a zombie",
-            "zombie mode", "can barely function",
-            "hitting a wall", "energy crash",
-            "always tired", "so tired", "extremely tired",
-            "fatigue hits", "fatigue in waves",
-        ]
-    },
-
-    "headaches": {
-        "category": "side_effect",
-        "description": "Headaches and migraines",
-        "keywords": [
-            "headache", "headaches", "migraine", "head pain",
-            "splitting headache", "persistent headaches",
-            # Reddit informal
-            "head is pounding", "pounding headache",
-            "head splitting", "killer headache",
-            "head hurts", "my head", "constant headaches",
-        ]
-    },
-
-    "injection_reactions": {
-        "category": "side_effect",
-        "description": "Injection site reactions",
-        "keywords": [
-            "injection", "inject", "needle", "pen",
-            "dose", "dosage", "shot", "injection site",
-            "site reaction", "bruise", "redness", "bump",
-            "lump", "swelling",
-            # Reddit informal
-            "shooting up", "jab", "stabbing myself",
-            "pen hurts", "painful injection",
-        ]
-    },
-
-    "hair_loss": {
-        "category": "side_effect",
-        "description": "Hair thinning or loss",
-        "keywords": [
-            "hair loss", "hair thinning", "thinning",
-            "hair shedding", "losing hair", "hair falling",
-            "shedding", "bald",
-            # Reddit expressions
-            "hair falling out", "clumps of hair",
-            "hair in shower", "hair everywhere",
-            "hair is gone", "ozempic hair",
-        ]
-    },
-
-    "ozempic_face": {
-        "category": "side_effect",
-        "description": "Facial volume loss (community-coined term)",
-        "keywords": [
-            # Reddit-coined community term — not in any medical dictionary
-            "ozempic face",
-            "face sagging", "face gaunt", "gaunt face",
-            "face changes", "face looking old",
-            "face volume", "lost volume in face",
-            "older looking", "face aging",
-            "saggy face", "face looks different",
-            "facial wasting", "face too thin",
-        ]
-    },
-
-    "brain_fog": {
-        "category": "side_effect",
-        "description": "Cognitive effects and mental clarity issues",
-        "keywords": [
-            # Community-coined term
-            "brain fog",
-            "foggy brain", "foggy thinking",
-            # Reddit informal
-            "cant concentrate", "cannot concentrate",
-            "hard to think", "trouble thinking",
-            "memory issues", "forgetting things",
-            "mental clarity", "cognitive", "brain not working",
-            "not thinking clearly", "confused",
-            "trouble focusing", "hard to focus",
-        ]
-    },
-
-    "mental_effects": {
-        "category": "side_effect",
-        "description": "Mood and psychological side effects",
-        "keywords": [
-            "depression", "anxiety", "mood", "mood swings",
-            "irritable", "emotional", "mental health",
-            "psychological", "worried", "panic",
-            # Reddit expressions
-            "feeling down", "feeling low", "crying",
-            "emotional wreck", "mood is off",
-            "not myself", "feel different mentally",
-        ]
-    },
-}
-
-
-# ═══════════════════════════════════════════════════════════════
-# LAYER 4B: OPTIONAL FASTTEXT SEMANTIC EXPANSION
-# Use this when you have 10,000+ posts (full scraped dataset)
-# ═══════════════════════════════════════════════════════════════
-
-def train_fasttext_and_expand(df, aspects, min_corpus_size=1000,
-                               similarity_threshold=0.62, topn=12):
-    """
-    Optional Layer 4B: Train FastText on scraped corpus and
-    expand dictionary with discovered synonyms.
-
-    When to use:
-      ✓ You have 10,000+ posts from real scraped data
-      ✓ Vocabulary diversity is high (Reddit slang heavy)
-      ✗ Skip for GenAI/structured data (insufficient vocabulary)
-      ✗ Skip if corpus < 1,000 texts (embeddings unreliable)
-
-    FastText advantages over Word2Vec for Reddit:
-      - Handles "nausia" → similar vector to "nausea" via char n-grams
-      - Handles "barfing/barfed" → same concept automatically
-      - Works on out-of-vocabulary words (sub-word model)
-
-    Parameters:
-      similarity_threshold: 0.62 (lower than typical 0.65 for Reddit
-                            since informal text has noisier vectors)
-      topn: 12 nearest neighbours per seed word
-    """
-    if not USE_FASTTEXT:
-        print("⚠ FastText not available — skipping semantic expansion")
-        return aspects
-
-    corpus_size = len(df)
-    if corpus_size < min_corpus_size:
-        print(f"⚠ Corpus too small ({corpus_size} posts) for reliable FastText.")
-        print(f"  Need {min_corpus_size}+ posts. Skipping expansion.")
-        return aspects
-
-    print(f"\n─── FASTTEXT SEMANTIC EXPANSION ─────────────────────────")
-    print(f"  Corpus size: {corpus_size:,} posts — training FastText...")
-
-    # Tokenize preprocessed text
-    sentences = [text.split() for text in df["text_processed"].tolist()
-                 if isinstance(text, str) and len(text.split()) > 3]
-
-    # Train FastText (subword model — handles misspellings)
-    model = FastText(
-        sentences=sentences,
-        vector_size=100,
-        window=5,
-        min_count=3,          # Word must appear 3+ times
-        workers=4,
-        epochs=10,
-        sg=1,                 # Skip-gram (better for rare/informal words)
-        min_n=3,              # Min char n-gram (typo handling)
-        max_n=6,
-    )
-
-    print(f"  Vocabulary trained: {len(model.wv):,} tokens")
-
-    expanded_aspects = {}
-    for aspect_name, aspect_data in aspects.items():
-        seeds = aspect_data["keywords"]
-        discovered = []
-        all_terms = set(kw.lower() for kw in seeds)
-
-        for seed in seeds[:8]:  # Use first 8 seeds per aspect
-            seed_lower = seed.lower()
             try:
-                similar = model.wv.most_similar(seed_lower, topn=topn)
+                similar = model.wv.most_similar(query, topn=top_n)
                 for word, score in similar:
-                    if (score >= similarity_threshold
-                            and word not in all_terms
-                            and len(word) > 3
-                            and not word.isdigit()):
-                        all_terms.add(word)
-                        discovered.append(word)
+                    if (score >= threshold
+                            and len(word) >= 3
+                            and re.match(r"^[a-z]+$", word)):
+                        new_terms.add(word)
             except KeyError:
-                pass  # Seed not in vocabulary
+                pass   # word not in vocabulary — that's fine
 
-        expanded_aspects[aspect_name] = {
-            **aspect_data,
-            "keywords": list(set(seeds) | all_terms),
-            "keywords_discovered": discovered,
-        }
+        original   = set(seeds)
+        discovered = new_terms - original
+        expanded[aspect] = list(original | new_terms)
+
         if discovered:
-            print(f"  [{aspect_name}] +{len(discovered)} terms: {discovered[:5]}")
+            sample = sorted(discovered)[:6]
+            print(f"    [{aspect}] discovered: {', '.join(sample)}"
+                  f"{'...' if len(discovered) > 6 else ''}"
+                  f"  (+{len(discovered)} terms)")
 
-    return expanded_aspects
+    return expanded
 
 
-# ═══════════════════════════════════════════════════════════════
-# FULL PREPROCESSING PIPELINE (All 4 Layers Combined)
-# ═══════════════════════════════════════════════════════════════
+# ╔══════════════════════════════════════════════════════════════╗
+# ║   LAYER 3 — FUZZY MATCHING                                  ║
+# ╚══════════════════════════════════════════════════════════════╝
 
-def full_preprocessing_pipeline(text):
+def make_fuzzy_checker(keyword_list):
     """
-    Apply all 4 layers in sequence:
-
-    Input:  "nausia is killing me rn. tried ginger tea. down 22lbs tho"
-    Layer1: "nausea is killing me. tried ginger tea. lost 22 lbs though"
-    Layer2: "nausea is killing me. tried ginger tea. lost 22 lbs though"
-    Layer3: "nausea be kill me. try ginger tea. lose 22 lb though"
-    Output: ready for dictionary matching
-
-    Note: we match against BOTH original text and preprocessed text
-    for maximum coverage.
+    Returns a function that checks if any token in a text
+    fuzzy-matches any keyword in the list.
+    Catches: nausia→nausea, diareah→diarrhea, constipashun→constipation
     """
-    if not isinstance(text, str):
-        return "", ""
+    try:
+        from rapidfuzz import process, fuzz
 
-    original = text                          # Keep original for evidence reporting
-    normalized = normalize_text(text)        # Layer 1
-    spell_corrected = correct_spelling(normalized)  # Layer 2
-    lemmatized = lemmatize_text(spell_corrected)    # Layer 3
-    # Layer 4 (dictionary matching) happens in detect_aspects_in_text()
+        # Only single words are relevant for fuzzy matching
+        single_words = [kw for kw in keyword_list
+                        if len(kw.split()) == 1 and len(kw) >= 4]
 
-    return spell_corrected, lemmatized
+        def checker(tokens):
+            for token in tokens:
+                if len(token) < 4:
+                    continue
+                match = process.extractOne(
+                    token, single_words,
+                    scorer    = fuzz.ratio,
+                    score_cutoff = FUZZY_THRESHOLD,
+                )
+                if match:
+                    return True
+            return False
 
+        return checker
 
-def build_lemmatized_dictionary(aspects):
-    """Pre-lemmatize all dictionary keywords for fast matching."""
-    print("─── Building lemmatized dictionary ─────────────────────────")
-    lemma_aspects = {}
-    for aspect_name, aspect_data in aspects.items():
-        original_kws = aspect_data["keywords"]
-        all_kws = set()
-        for kw in original_kws:
-            all_kws.add(kw.lower())
-            all_kws.add(lemmatize_text(kw.lower()))
-            # Also add normalized version
-            all_kws.add(normalize_text(kw.lower()))
-        lemma_aspects[aspect_name] = {
-            **aspect_data,
-            "keywords_all": list(all_kws),
-        }
-        print(f"  [{aspect_name}]  {len(original_kws)} original → {len(all_kws)} (with lemmas)")
-    return lemma_aspects
+    except ImportError:
+        # rapidfuzz not installed — return dummy always returning False
+        return lambda tokens: False
 
 
-# ═══════════════════════════════════════════════════════════════
-# ASPECT DETECTION ENGINE
-# ═══════════════════════════════════════════════════════════════
+# ╔══════════════════════════════════════════════════════════════╗
+# ║   CORE MATCHING  — applies all 3 layers to one text         ║
+# ╚══════════════════════════════════════════════════════════════╝
 
-def detect_aspects_in_text(original_text, lemma_aspects):
+def match_one_text(text, expanded_benefits, expanded_side_effects, fuzzy_fns):
     """
-    Detect aspects using expanded + lemmatized dictionary.
-    Matches against BOTH:
-      - spell-corrected + normalized text (catches misspellings)
-      - lemmatized text (catches morphological variants)
-      - original text (safety net for any missed normalizations)
+    Check a single text against all aspects using 3 layers.
+    Returns a dict of {aspect_name: 0_or_1} plus summary columns.
     """
-    if not isinstance(original_text, str) or len(original_text.strip()) == 0:
-        return {a: {"detected": False, "evidence": [], "category": d["category"]}
-                for a, d in lemma_aspects.items()}
+    # Empty text guard
+    if not isinstance(text, str) or not text.strip():
+        result = {asp: 0 for asp in ALL_ASPECTS}
+        result.update({
+            "benefit_count": 0, "side_effect_count": 0,
+            "benefit_aspects": "", "side_effect_aspects": "",
+            "has_benefit": 0, "has_side_effect": 0, "has_both": 0,
+        })
+        return result
 
-    # Prepare all text versions for matching
-    spell_corrected, lemmatized = full_preprocessing_pipeline(original_text)
-    text_original_lower = original_text.lower()
+    text_lower = text.lower()
+    tokens     = re.findall(r"[a-z]{3,}", text_lower)   # for fuzzy layer
 
-    # All versions to match against
-    text_versions = [text_original_lower, spell_corrected, lemmatized]
+    found_ben = []
+    found_se  = []
+    result    = {}
 
-    results = {}
-    for aspect_name, aspect_data in lemma_aspects.items():
-        evidence = []
+    def check_aspect(aspect, keywords):
+        # Layer 1 + 2: direct string match (seed + expanded)
+        for kw in keywords:
+            if kw in text_lower:
+                return True
+        # Layer 3: fuzzy match
+        if aspect in fuzzy_fns:
+            return fuzzy_fns[aspect](tokens)
+        return False
 
-        for kw in aspect_data["keywords_all"]:
-            kw_lower = kw.lower()
-            if len(kw_lower) < 3:
-                continue
-            # Check keyword against all text versions
-            for tv in text_versions:
-                if kw_lower in tv:
-                    evidence.append(kw_lower)
-                    break  # Found in at least one version
+    for aspect, keywords in expanded_benefits.items():
+        hit = check_aspect(aspect, keywords)
+        result[aspect] = 1 if hit else 0
+        if hit:
+            found_ben.append(aspect)
 
-        results[aspect_name] = {
-            "detected": len(evidence) > 0,
-            "evidence": list(set(evidence))[:3],
-            "category": aspect_data["category"],
-        }
+    for aspect, keywords in expanded_side_effects.items():
+        hit = check_aspect(aspect, keywords)
+        result[aspect] = 1 if hit else 0
+        if hit:
+            found_se.append(aspect)
 
-    return results
+    # Summary columns — used directly in later analyses
+    result["benefit_count"]      = len(found_ben)
+    result["side_effect_count"]  = len(found_se)
+    result["benefit_aspects"]    = "|".join(found_ben)
+    result["side_effect_aspects"]= "|".join(found_se)
+    result["has_benefit"]        = 1 if found_ben else 0
+    result["has_side_effect"]    = 1 if found_se  else 0
+    result["has_both"]           = 1 if (found_ben and found_se) else 0
+
+    return result
 
 
-# ═══════════════════════════════════════════════════════════════
-# DATA LOADING
-# ═══════════════════════════════════════════════════════════════
+# ╔══════════════════════════════════════════════════════════════╗
+# ║   FREQUENCY TABLE                                           ║
+# ╚══════════════════════════════════════════════════════════════╝
 
-def load_data(reddit_path=None, reviews_path=None):
-    """
-    Load data from CSV files.
-    Handles both the current GenAI dataset and real scraped data.
+def make_frequency_table(df):
+    total = len(df)
+    rows  = []
 
-    For real scraped data, expected columns:
-      Reddit: post_id, post_text, comment_text (optional), subreddit, post_date
-      Reviews: review_id, review_text, rating, platform, review_date
-    """
-    print("\n─── LOADING DATA ────────────────────────────────────────────")
+    for aspect in list(BENEFITS.keys()) + list(SIDE_EFFECTS.keys()):
+        if aspect not in df.columns:
+            continue
+        n   = int(df[aspect].sum())
+        cat = "Benefit" if aspect in BENEFITS else "Side Effect"
+        rows.append({
+            "aspect"   : aspect,
+            "category" : cat,
+            "count"    : n,
+            "percent"  : round(n / total * 100, 2) if total > 0 else 0.0,
+        })
 
-    # Default paths
-    if not reddit_path:
-        for p in ["F:/MBA 2025-27/SEM 2/3_CREDIT/Research structure/Study 1/Study 1_Analysis 1/Dataset/primary_ozempic_reddit_data.csv",
-                  "primary_ozempic_reddit_data.csv"]:
-            if os.path.exists(p):
-                reddit_path = p
-                break
+    freq = pd.DataFrame(rows).sort_values("count", ascending=False)
+    freq["rank"] = range(1, len(freq) + 1)
+    return freq
 
-    if not reviews_path:
-        for p in ["F:/MBA 2025-27/SEM 2/3_CREDIT/Research structure/Study 1/Study 1_Analysis 1/Dataset/secondary_ozempic_reviews_data.csv",
-                  "secondary_ozempic_reviews_data.csv"]:
-            if os.path.exists(p):
-                reviews_path = p
-                break
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║   PLAIN ENGLISH REPORT                                      ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+def write_report(df, freq_df, path):
+    total = len(df)
+    n_b   = int(df["has_benefit"].sum())
+    n_se  = int(df["has_side_effect"].sum())
+    n_bo  = int(df["has_both"].sum())
+
+    lines = []
+    lines.append("=" * 62)
+    lines.append("  ANALYSIS 1: ASPECT EXTRACTION — RESULTS")
+    lines.append("  Ozempic Consumer Discourse Study")
+    lines.append("=" * 62)
+
+    lines.append(f"\n  DATASET OVERVIEW")
+    lines.append(f"  Total records analysed : {total}")
+    if "source_type" in df.columns:
+        for src, n in df["source_type"].value_counts().items():
+            lines.append(f"  {src:<28}: {n}  ({n/total*100:.1f}%)")
+
+    lines.append(f"\n  COVERAGE")
+    lines.append(f"  Posts with ≥1 benefit      : {n_b}  ({n_b/total*100:.1f}%)")
+    lines.append(f"  Posts with ≥1 side effect  : {n_se}  ({n_se/total*100:.1f}%)")
+    lines.append(f"  Posts mentioning BOTH       : {n_bo}  ({n_bo/total*100:.1f}%)")
+    lines.append(f"  → These {n_bo} posts are the core trade-off corpus for Analysis 2")
+
+    lines.append(f"\n  TOP BENEFITS:")
+    for _, row in freq_df[freq_df["category"]=="Benefit"].head(5).iterrows():
+        bar = "█" * max(1, int(row["percent"] / 2))
+        lines.append(f"    {row['aspect']:<28} {bar}  {row['percent']:.1f}%  (n={row['count']})")
+
+    lines.append(f"\n  TOP SIDE EFFECTS:")
+    for _, row in freq_df[freq_df["category"]=="Side Effect"].head(5).iterrows():
+        bar = "█" * max(1, int(row["percent"] / 2))
+        lines.append(f"    {row['aspect']:<28} {bar}  {row['percent']:.1f}%  (n={row['count']})")
+
+    lines.append(f"\n  INTERPRETATION FOR RO1:")
+    lines.append(f"  {n_bo/total*100:.1f}% of records simultaneously mention benefits")
+    lines.append(f"  and side effects — confirming that dual-evaluation discourse")
+    lines.append(f"  exists and providing the aspect-level labels needed for")
+    lines.append(f"  Analysis 2 (ABSA) and Analysis 6 (trade-off detection).")
+
+    lines.append(f"\n  OUTPUT FILES:")
+    lines.append(f"  results/A1_aspect_results.csv   ← full dataset with flags")
+    lines.append(f"  results/A1_frequency_table.csv  ← aspect frequency counts")
+    lines.append(f"  results/A1_report.txt           ← this report")
+    lines.append("=" * 62)
+
+    text = "\n".join(lines)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(text)
+    return text
+
+
+# ╔══════════════════════════════════════════════════════════════╗
+# ║   MAIN PIPELINE                                             ║
+# ╚══════════════════════════════════════════════════════════════╝
+
+def run():
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    print("=" * 62)
+    print("  ANALYSIS 1 — ASPECT EXTRACTION")
+    print("  3-Layer: Dictionary + FastText + Fuzzy Matching")
+    print("=" * 62)
+
+    # ── Step 1: Load data ────────────────────────────────────
+    print("\n  [Step 1] Loading data...")
 
     dfs = []
 
-    if reddit_path and os.path.exists(reddit_path):
-        reddit = pd.read_csv(reddit_path)
-        reddit["combined_text"] = (
-            reddit.get("post_text", pd.Series([""] * len(reddit))).fillna("") + " " +
-            reddit.get("comment_text", pd.Series([""] * len(reddit))).fillna("")
-        ).str.strip()
-        reddit["source"] = "Reddit"
-        reddit["text_id"] = reddit.get("post_id", reddit.index.astype(str))
-        reddit["platform"] = reddit.get("subreddit", "Reddit")
-        dfs.append(reddit[["text_id", "source", "platform", "combined_text",
-                            "sentiment_label",
-                            "contains_benefit_mention",
-                            "contains_side_effect_mention",
-                            "contains_trade_off_language"]])
-        print(f"✓ Reddit: {len(reddit):,} posts")
+    if os.path.exists(PRIMARY_FILE):
+        df_primary = pd.read_csv(PRIMARY_FILE, encoding="utf-8-sig")
+        df_primary["source_type"] = "Reddit"
+        dfs.append(df_primary)
+        print(f"  Primary   : {len(df_primary):>5} rows  ({PRIMARY_FILE})")
+    else:
+        print(f"  ⚠  Primary file not found: {PRIMARY_FILE}")
+        print(f"     Run scraper_primary_full.py  (full scale)")
+        print(f"     OR   scraper_primary.py      (pilot 1,000 rows)")
 
-    if reviews_path and os.path.exists(reviews_path):
-        reviews = pd.read_csv(reviews_path)
-        reviews["combined_text"] = reviews.get("review_text", pd.Series([""] * len(reviews))).fillna("")
-        reviews["source"] = "Review_Platform"
-        reviews["text_id"] = reviews.get("review_id", reviews.index.astype(str))
-        reviews["platform"] = reviews.get("platform", "Reviews")
-        dfs.append(reviews[["text_id", "source", "platform", "combined_text",
-                             "sentiment_label",
-                             "contains_benefit_mention",
-                             "contains_side_effect_mention",
-                             "contains_trade_off_language"]])
-        print(f"✓ Reviews: {len(reviews):,} reviews")
+    if os.path.exists(SECONDARY_FILE):
+        df_secondary = pd.read_csv(SECONDARY_FILE, encoding="utf-8-sig")
+        df_secondary["source_type"] = "Review_Platform"
+        dfs.append(df_secondary)
+        print(f"  Secondary : {len(df_secondary):>5} rows  ({SECONDARY_FILE})")
+    else:
+        print(f"  ⚠  Secondary file not found: {SECONDARY_FILE}")
+        print(f"     Run scraper_secondary_full.py  (full scale)")
+        print(f"     OR   scraper_secondary.py      (pilot 1,000 rows)")
 
     if not dfs:
-        raise FileNotFoundError("No data files found. Check file paths.")
+        print("\n  ✗ No data files found. Run both scrapers first.")
+        return None
 
     df = pd.concat(dfs, ignore_index=True)
-    print(f"✓ Combined: {len(df):,} total texts")
-    return df
+
+    # Ensure combined_text column exists
+    if TEXT_COLUMN not in df.columns:
+        # Try to build it from whatever text columns exist
+        text_cols = [c for c in ["combined_text", "text", "post_text",
+                                  "review_text", "body"] if c in df.columns]
+        if text_cols:
+            df[TEXT_COLUMN] = df[text_cols[0]].fillna("")
+            print(f"  Using '{text_cols[0]}' as text column")
+        else:
+            print(f"  ✗ No text column found. Available: {list(df.columns)}")
+            return None
+
+    df[TEXT_COLUMN] = df[TEXT_COLUMN].fillna("")
+    texts = df[TEXT_COLUMN].tolist()
+    print(f"\n  Total records to analyse: {len(df)}")
+
+    # ── Step 2: FastText expansion (Layer 2) ─────────────────
+    print(f"\n  [Step 2] FastText Semantic Expansion")
+    exp_benefits   = dict(BENEFITS)
+    exp_side_effects = dict(SIDE_EFFECTS)
+
+    if len(texts) >= FASTTEXT_MIN_CORPUS:
+        print(f"  Corpus size {len(texts):,} ≥ threshold {FASTTEXT_MIN_CORPUS:,} → FastText activating")
+        ft = train_fasttext(texts)
+        if ft:
+            print("  Expanding benefit aspects...")
+            exp_benefits = expand_with_fasttext(
+                ft, BENEFITS, FASTTEXT_SIMILARITY, FASTTEXT_TOP_N)
+            print("  Expanding side-effect aspects...")
+            exp_side_effects = expand_with_fasttext(
+                ft, SIDE_EFFECTS, FASTTEXT_SIMILARITY, FASTTEXT_TOP_N)
+
+            # Save expanded dictionary for transparency / supervisor review
+            all_exp = {**exp_benefits, **exp_side_effects}
+            dict_path = os.path.join(OUTPUT_DIR, "A1_expanded_dictionary.json")
+            with open(dict_path, "w") as f:
+                json.dump(all_exp, f, indent=2)
+            print(f"  Expanded dictionary saved → {dict_path}")
+        else:
+            print("  Using seed dictionary only (FastText unavailable)")
+    else:
+        print(f"  Corpus size {len(texts)} < threshold {FASTTEXT_MIN_CORPUS}")
+        print("  Using seed dictionary only — this is fine for a pilot dataset")
+
+    # ── Step 3: Build fuzzy matchers (Layer 3) ───────────────
+    print(f"\n  [Step 3] Building Fuzzy Matchers (Layer 3)")
+    fuzzy_fns = {}
+    has_fuzzy = False
+    try:
+        import rapidfuzz  # noqa — just checking availability
+        for aspect, kws in {**exp_benefits, **exp_side_effects}.items():
+            fuzzy_fns[aspect] = make_fuzzy_checker(kws)
+        has_fuzzy = True
+        print(f"  ✅ Fuzzy matchers ready for {len(fuzzy_fns)} aspects")
+    except ImportError:
+        print("  ⚠  rapidfuzz not installed — fuzzy matching skipped")
+        print("     Install: pip install rapidfuzz")
+
+    # ── Step 4: Match aspects in all records ─────────────────
+    print(f"\n  [Step 4] Extracting aspects from {len(df)} records...")
+    aspect_rows = []
+    for i, text in enumerate(texts):
+        aspect_rows.append(
+            match_one_text(text, exp_benefits, exp_side_effects, fuzzy_fns))
+        if (i + 1) % 200 == 0:
+            print(f"    {i+1} / {len(texts)} processed", end="\r")
+
+    print(f"    {len(texts)} / {len(texts)} ✅ done        ")
+
+    aspects_df = pd.DataFrame(aspect_rows)
+    df_out     = pd.concat([df.reset_index(drop=True), aspects_df], axis=1)
+
+    # ── Step 5: Frequency table ───────────────────────────────
+    print(f"\n  [Step 5] Computing aspect frequencies...")
+    freq_df = make_frequency_table(df_out)
+
+    # ── Step 6: Save outputs ──────────────────────────────────
+    print(f"\n  [Step 6] Saving results...")
+
+    path_results = os.path.join(OUTPUT_DIR, "A1_aspect_results.csv")
+    path_freq    = os.path.join(OUTPUT_DIR, "A1_frequency_table.csv")
+    path_report  = os.path.join(OUTPUT_DIR, "A1_report.txt")
+
+    df_out.to_csv(path_results, index=False, encoding="utf-8-sig")
+    freq_df.to_csv(path_freq, index=False, encoding="utf-8-sig")
+    report_text = write_report(df_out, freq_df, path_report)
+
+    # ── Print report ──────────────────────────────────────────
+    print("\n" + report_text)
+
+    print(f"\n  Output files saved in  results/")
+    print(f"  ├── A1_aspect_results.csv     ← pass this to Analysis 2")
+    print(f"  ├── A1_frequency_table.csv    ← aspect counts for write-up")
+    if has_fuzzy and len(texts) >= FASTTEXT_MIN_CORPUS:
+        print(f"  ├── A1_expanded_dictionary.json ← shows what FastText discovered")
+    print(f"  └── A1_report.txt             ← plain English summary")
+
+    return df_out, freq_df
 
 
-# ═══════════════════════════════════════════════════════════════
-# MAIN EXTRACTION PIPELINE
-# ═══════════════════════════════════════════════════════════════
-
-def run_aspect_extraction(df, lemma_aspects):
-    """Run full aspect detection with preprocessing on all texts."""
-    print("\n─── ASPECT EXTRACTION (with 4-layer preprocessing) ─────────")
-
-    # Pre-process all texts (store for reuse in later analyses)
-    tqdm.pandas(desc="Preprocessing texts")
-    df["text_processed"] = df["combined_text"].progress_apply(
-        lambda t: full_preprocessing_pipeline(t)[0]  # spell-corrected version
-    )
-    df["text_lemmatized"] = df["combined_text"].progress_apply(
-        lambda t: full_preprocessing_pipeline(t)[1]  # lemmatized version
-    )
-
-    benefit_aspects     = [a for a, d in lemma_aspects.items() if d["category"] == "benefit"]
-    side_effect_aspects = [a for a, d in lemma_aspects.items() if d["category"] == "side_effect"]
-
-    records = []
-    for _, row in tqdm(df.iterrows(), total=len(df), desc="Detecting aspects"):
-        detection = detect_aspects_in_text(row["combined_text"], lemma_aspects)
-
-        record = {
-            "text_id":                     row["text_id"],
-            "source":                      row["source"],
-            "platform":                    row["platform"],
-            "sentiment_label":             row.get("sentiment_label", ""),
-            "contains_benefit_mention":    row.get("contains_benefit_mention", 0),
-            "contains_side_effect_mention": row.get("contains_side_effect_mention", 0),
-            "contains_trade_off_language": row.get("contains_trade_off_language", 0),
-            "text_preview":                str(row["combined_text"])[:120],
-            "text_processed_preview":      str(row["text_processed"])[:120],
-        }
-
-        for aspect_name, result in detection.items():
-            record[f"has_{aspect_name}"]      = int(result["detected"])
-            record[f"evidence_{aspect_name}"] = "|".join(result["evidence"])
-
-        record["benefit_count"]     = sum(int(detection[a]["detected"]) for a in benefit_aspects)
-        record["side_effect_count"] = sum(int(detection[a]["detected"]) for a in side_effect_aspects)
-        record["total_aspects"]     = record["benefit_count"] + record["side_effect_count"]
-        record["has_both"]          = int(record["benefit_count"] > 0 and record["side_effect_count"] > 0)
-
-        records.append(record)
-
-    df_out = pd.DataFrame(records)
-
-    # ── Coverage Report ───────────────────────────────────────
-    total    = len(df_out)
-    detected = (df_out["total_aspects"] > 0).sum()
-    both     = df_out["has_both"].sum()
-
-    print(f"\n  Coverage:              {detected}/{total} ({detected/total*100:.1f}%)")
-    print(f"  Both (trade-off):      {both} ({both/total*100:.1f}%)")
-    print(f"  Benefits only:         {((df_out['benefit_count']>0)&(df_out['side_effect_count']==0)).sum()}")
-    print(f"  Side effects only:     {((df_out['side_effect_count']>0)&(df_out['benefit_count']==0)).sum()}")
-    print(f"  Neither:               {(df_out['total_aspects']==0).sum()}")
-
-    return df_out
-
-
-# ═══════════════════════════════════════════════════════════════
-# FREQUENCY, CO-OCCURRENCE, VISUALIZATION, SAVE
-# (Same as before — see Analysis_1_Final.py for full versions)
-# ═══════════════════════════════════════════════════════════════
-
-def aspect_frequency_analysis(df_out, lemma_aspects):
-    rows = []
-    for aspect_name, aspect_data in lemma_aspects.items():
-        col = f"has_{aspect_name}"
-        count_total  = df_out[col].sum()
-        count_reddit = df_out[df_out["source"] == "Reddit"][col].sum()
-        count_review = df_out[df_out["source"] == "Review_Platform"][col].sum()
-        rows.append({
-            "aspect":       aspect_name.replace("_", " ").title(),
-            "category":     aspect_data["category"],
-            "total_count":  int(count_total),
-            "pct_total":    round(count_total / len(df_out) * 100, 1),
-            "reddit_count": int(count_reddit),
-            "review_count": int(count_review),
-        })
-    df_freq = pd.DataFrame(rows).sort_values("total_count", ascending=False)
-    print("\n─── ASPECT FREQUENCY ────────────────────────────────────────")
-    print(df_freq.to_string(index=False))
-    return df_freq
-
-
-def save_outputs(df_out, df_freq, lemma_aspects):
-    os.makedirs("outputs", exist_ok=True)
-    df_out.to_csv("outputs/analysis1_full_results.csv", index=False)
-    df_freq.to_csv("outputs/analysis1_frequency_summary.csv", index=False)
-    trade_off = df_out[df_out["has_both"] == 1]
-    trade_off.to_csv("outputs/analysis1_tradeoff_candidates.csv", index=False)
-    print(f"\n✓ Saved: {len(df_out):,} rows to outputs/analysis1_full_results.csv")
-    print(f"✓ Saved: {len(trade_off):,} trade-off posts to outputs/analysis1_tradeoff_candidates.csv")
-    print(f"  → These trade-off posts feed directly into Analysis 2 (ABSA)")
-
-
-# ═══════════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════════
-
-def run_analysis1(reddit_path=None, reviews_path=None,
-                  use_fasttext_expansion=False):
-    """
-    MAIN ENTRY POINT
-
-    For current GenAI dataset:
-      run_analysis1()  — uses uploaded CSV paths automatically
-
-    For real scraped Reddit data:
-      run_analysis1(
-          reddit_path="scraped_reddit_ozempic.csv",
-          reviews_path="scraped_reviews.csv",
-          use_fasttext_expansion=True   # Enable when corpus >= 10,000 posts
-      )
-    """
-    print("=" * 62)
-    print("  ANALYSIS 1: ASPECT EXTRACTION — PRODUCTION VERSION")
-    print("  4-Layer Pipeline: Normalize → Spell → Lemmatize → Dict")
-    print("=" * 62)
-
-    # Build dictionary
-    lemma_aspects = build_lemmatized_dictionary(ASPECTS)
-
-    # Load data
-    df = load_data(reddit_path, reviews_path)
-
-    # Optional FastText expansion (for large real scraped corpus)
-    if use_fasttext_expansion and USE_FASTTEXT:
-        # Pre-process texts first (FastText trains on clean text)
-        df["text_processed"] = df["combined_text"].apply(
-            lambda t: full_preprocessing_pipeline(t)[0])
-        expanded = train_fasttext_and_expand(
-            df, ASPECTS,
-            min_corpus_size=1000,
-            similarity_threshold=0.62,
-            topn=12
-        )
-        lemma_aspects = build_lemmatized_dictionary(expanded)
-
-    # Run extraction
-    df_out = run_aspect_extraction(df, lemma_aspects)
-
-    # Frequency analysis
-    df_freq = aspect_frequency_analysis(df_out, lemma_aspects)
-
-    # Save
-    save_outputs(df_out, df_freq, lemma_aspects)
-
-    print("\n" + "=" * 62)
-    print("  ANALYSIS 1 COMPLETE")
-    print(f"  Coverage:        {(df_out['total_aspects']>0).mean()*100:.1f}%")
-    print(f"  Trade-off posts: {df_out['has_both'].sum()} ({df_out['has_both'].mean()*100:.1f}%)")
-    print("=" * 62)
-
-    return df_out, lemma_aspects
-
-
-# ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-
-    # ── For GenAI/current dataset ────────────────────────────
-    df_out, lemma_aspects = run_analysis1()
-
-    # ── For real scraped Reddit data ─────────────────────────
-    # df_out, lemma_aspects = run_analysis1(
-    #     reddit_path="scraped_reddit_ozempic.csv",
-    #     reviews_path="scraped_drug_reviews.csv",
-    #     use_fasttext_expansion=True  # Enable for 10,000+ posts
-    # )
+    run()
